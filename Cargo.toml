@@ -8,5 +8,6 @@ members = [
   "crates/lw-lsp-native",
   "crates/lw-lsp-wasm",
   "crates/lw-wasm",
+  "crates/lw-demo",
 ]
 resolver = "2"

@@ -8,6 +8,7 @@ lw-vfs = { path = "../lw-vfs" }
 lw-cst = { path = "../lw-cst" }
 lw-ast = { path = "../lw-ast" }
 lw-analysis = { path = "../lw-analysis" }
+logos = "0.16"
 salsa = "0.26"
 
 [dev-dependencies]

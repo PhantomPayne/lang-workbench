@@ -44,8 +44,14 @@ impl PartialEq for AstNodeKind {
         match (self, other) {
             (Self::Root, Self::Root) => true,
             (
-                Self::LetBinding { name: n1, value: v1 },
-                Self::LetBinding { name: n2, value: v2 },
+                Self::LetBinding {
+                    name: n1,
+                    value: v1,
+                },
+                Self::LetBinding {
+                    name: n2,
+                    value: v2,
+                },
             ) => n1 == n2 && v1 == v2,
             (Self::Import { path: p1 }, Self::Import { path: p2 }) => p1 == p2,
             (

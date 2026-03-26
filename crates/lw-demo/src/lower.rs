@@ -37,7 +37,10 @@ fn lower_node(
             // We need to allocate the LetBinding node, but the value node
             // isn't allocated yet. Use a placeholder and patch it after.
             let binding_id = out.alloc(
-                AstNodeKind::LetBinding { name: name_str, value: 0 },
+                AstNodeKind::LetBinding {
+                    name: name_str,
+                    value: 0,
+                },
                 name.clone(),
                 parent,
             );
@@ -67,24 +70,35 @@ fn lower_node(
         CstNode::BinaryExpr { op, lhs, rhs } => {
             // Allocate BinaryExpr with placeholder children, then patch.
             let expr_id = out.alloc(
-                AstNodeKind::BinaryExpr { op: op.clone(), lhs: 0, rhs: 0 },
+                AstNodeKind::BinaryExpr {
+                    op: op.clone(),
+                    lhs: 0,
+                    rhs: 0,
+                },
                 TextRange::default(),
                 parent,
             );
-            let lhs_id =
-                lower_node(arena, *lhs, source, Some(expr_id), out).unwrap_or(expr_id);
-            let rhs_id =
-                lower_node(arena, *rhs, source, Some(expr_id), out).unwrap_or(expr_id);
-            out.kinds[expr_id as usize] =
-                AstNodeKind::BinaryExpr { op: op.clone(), lhs: lhs_id, rhs: rhs_id };
+            let lhs_id = lower_node(arena, *lhs, source, Some(expr_id), out).unwrap_or(expr_id);
+            let rhs_id = lower_node(arena, *rhs, source, Some(expr_id), out).unwrap_or(expr_id);
+            out.kinds[expr_id as usize] = AstNodeKind::BinaryExpr {
+                op: op.clone(),
+                lhs: lhs_id,
+                rhs: rhs_id,
+            };
             Some(expr_id)
         }
-        CstNode::Literal { kind: lw_cst::LiteralKind::Integer, range } => {
+        CstNode::Literal {
+            kind: lw_cst::LiteralKind::Integer,
+            range,
+        } => {
             let text = slice(source, range);
             let value: i64 = text.parse().unwrap_or(0);
             Some(out.alloc(AstNodeKind::IntLiteral(value), range.clone(), parent))
         }
-        CstNode::Literal { kind: lw_cst::LiteralKind::Float, range } => {
+        CstNode::Literal {
+            kind: lw_cst::LiteralKind::Float,
+            range,
+        } => {
             let text = slice(source, range);
             let value: f64 = text.parse().unwrap_or(0.0);
             Some(out.alloc(AstNodeKind::FloatLiteral(value), range.clone(), parent))
@@ -94,9 +108,7 @@ fn lower_node(
             Some(out.alloc(AstNodeKind::Identifier(name), range.clone(), parent))
         }
         // Trivia and errors are stripped during lowering.
-        CstNode::Whitespace { .. }
-        | CstNode::Comment { .. }
-        | CstNode::Error { .. } => None,
+        CstNode::Whitespace { .. } | CstNode::Comment { .. } | CstNode::Error { .. } => None,
     }
 }
 

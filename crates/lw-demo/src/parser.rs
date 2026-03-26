@@ -28,11 +28,12 @@ pub struct ParseResult {
 // ---------------------------------------------------------------------------
 
 struct Parser<'src> {
-    source: &'src str,
     tokens: Vec<Token>,
     pos: usize,
     arena: CstArena,
     errors: Vec<ParseError>,
+    #[allow(dead_code)]
+    source: &'src str,
 }
 
 impl<'src> Parser<'src> {
@@ -55,16 +56,6 @@ impl<'src> Parser<'src> {
 
     fn current_kind(&self) -> &TokenKind {
         &self.current().kind
-    }
-
-    fn peek_non_trivia(&self) -> &TokenKind {
-        let mut i = self.pos;
-        loop {
-            match &self.tokens[i].kind {
-                TokenKind::Whitespace | TokenKind::Newline | TokenKind::Comment => i += 1,
-                k => return k,
-            }
-        }
     }
 
     fn advance(&mut self) -> Token {
@@ -110,10 +101,10 @@ impl<'src> Parser<'src> {
             TokenKind::IntLiteral => {
                 let range = self.current().range.clone();
                 self.advance();
-                Some(
-                    self.arena
-                        .alloc(CstNode::Literal { kind: LiteralKind::Integer, range }),
-                )
+                Some(self.arena.alloc(CstNode::Literal {
+                    kind: LiteralKind::Integer,
+                    range,
+                }))
             }
             TokenKind::Ident => {
                 let range = self.current().range.clone();
@@ -124,10 +115,7 @@ impl<'src> Parser<'src> {
                 let range = self.current().range.clone();
                 self.errors.push(ParseError {
                     range: range.clone(),
-                    message: format!(
-                        "expected expression, found {:?}",
-                        self.current_kind()
-                    ),
+                    message: format!("expected expression, found {:?}", self.current_kind()),
                 });
                 let id = self.arena.alloc(CstNode::Error {
                     range,
@@ -142,10 +130,12 @@ impl<'src> Parser<'src> {
     fn parse_expr(&mut self) -> CstNodeId {
         let mut lhs = match self.parse_primary() {
             Some(id) => id,
-            None => return self.arena.alloc(CstNode::Error {
-                range: self.current().range.clone(),
-                message: "expected expression".to_string(),
-            }),
+            None => {
+                return self.arena.alloc(CstNode::Error {
+                    range: self.current().range.clone(),
+                    message: "expected expression".to_string(),
+                });
+            }
         };
 
         loop {
@@ -256,7 +246,10 @@ impl<'src> Parser<'src> {
 
         let value = self.parse_expr();
 
-        self.arena.alloc(CstNode::LetBinding { name: name_range, value })
+        self.arena.alloc(CstNode::LetBinding {
+            name: name_range,
+            value,
+        })
     }
 
     /// Parse an `import "<path>"` statement. The `import` token has already
@@ -340,5 +333,9 @@ impl<'src> Parser<'src> {
 pub fn parse(source: &str) -> ParseResult {
     let mut p = Parser::new(source);
     let root = p.parse_root();
-    ParseResult { arena: p.arena, root, errors: p.errors }
+    ParseResult {
+        arena: p.arena,
+        root,
+        errors: p.errors,
+    }
 }

@@ -2,16 +2,45 @@
 //!
 //! Wires the parse → lower → resolve pipeline into Salsa so that only the
 //! queries that depend on a changed file are re-executed.
+//!
+//! Only [`file_diagnostics`] is a `#[salsa::tracked]` query — that is
+//! sufficient for end-to-end incrementality because Salsa records every read
+//! of a [`SourceFile`]'s `text` field that happens during the query, including
+//! reads for imported files.  All other pipeline steps are plain functions
+//! called within the tracked query.
 
 use std::collections::HashMap;
+
+use salsa::Setter;
 
 use lw_ast::AstNodes;
 
 use crate::{
     lower::lower,
     parser::{ParseResult, parse},
-    resolver::{Diagnostic, ResolvedProgram, Severity, collect_bindings_from, check_identifiers_against},
+    resolver::{Diagnostic, Severity, check_identifiers_against, collect_bindings_from},
 };
+
+// ---------------------------------------------------------------------------
+// Salsa::Update for local types
+// ---------------------------------------------------------------------------
+
+// `file_diagnostics` returns `Vec<Diagnostic>`.  salsa requires the element
+// type to implement `salsa::Update`.  `Diagnostic` is defined in this crate
+// so the orphan rule permits the impl here.
+unsafe impl salsa::Update for Diagnostic {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        // SAFETY: caller guarantees old_pointer is valid and aligned.
+        unsafe {
+            if *old_pointer == new_value {
+                false
+            } else {
+                *old_pointer = new_value;
+                true
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Salsa input
@@ -31,34 +60,42 @@ pub struct SourceFile {
 }
 
 // ---------------------------------------------------------------------------
-// Salsa tracked queries
+// Pipeline helpers (not Salsa tracked — called inside tracked queries)
 // ---------------------------------------------------------------------------
 
 /// Parse a source file into a CST.
-#[salsa::tracked]
+///
+/// Not a Salsa tracked query; call this from within a tracked function so
+/// the read of `file.text(db)` is recorded as a dependency.
 pub fn parse_cst(db: &dyn Db, file: SourceFile) -> ParseResult {
     let text = file.text(db);
-    parse(text)
+    parse(&text)
 }
 
 /// Lower a source file's CST into an [`AstNodes`] store.
-#[salsa::tracked]
+///
+/// Not a Salsa tracked query; call this from within a tracked function.
 pub fn lower_ast(db: &dyn Db, file: SourceFile) -> AstNodes {
     let text = file.text(db);
-    let result = parse_cst(db, file);
-    lower(&result.arena, result.root, text)
+    let result = parse(&text);
+    lower(&result.arena, result.root, &text)
 }
+
+// ---------------------------------------------------------------------------
+// Salsa tracked query
+// ---------------------------------------------------------------------------
 
 /// Collect all diagnostics for a file (parse errors + resolution errors).
 ///
-/// This query establishes Salsa dependencies on every file it reads, so
-/// changing an imported file automatically invalidates this query for the
-/// importing file.
+/// This is the only `#[salsa::tracked]` query in the pipeline.  Salsa
+/// records every read of a `SourceFile`'s `text` field that occurs during
+/// this query — including reads for imported files — so changing any
+/// dependency automatically re-runs this query for files that depend on it.
 #[salsa::tracked]
 pub fn file_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let text = file.text(db);
-    let parse_result = parse_cst(db, file);
-    let ast = lower_ast(db, file);
+    let parse_result = parse(&text);
+    let ast = lower(&parse_result.arena, parse_result.root, &text);
 
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
@@ -73,29 +110,23 @@ pub fn file_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
 
     let mut bindings = HashMap::new();
 
-    // Resolve imports — calling lower_ast on each imported file registers a
-    // Salsa dependency, so changes to imported files propagate here.
-    for kind in &ast.kinds {
+    // Resolve imports — reading each imported file's text establishes a Salsa
+    // dependency, so changes to imported files propagate here automatically.
+    for (i, kind) in ast.kinds.iter().enumerate() {
         let lw_ast::AstNodeKind::Import { path: import_path } = kind else {
             continue;
         };
         match db.file_for_path(import_path) {
             Some(imported_file) => {
-                let imported_ast = lower_ast(db, imported_file);
+                let imported_text = imported_file.text(db);
+                let imported_result = parse(&imported_text);
+                let imported_ast =
+                    lower(&imported_result.arena, imported_result.root, &imported_text);
                 collect_bindings_from(&imported_ast, &mut bindings, &mut diagnostics);
             }
             None => {
-                // Find the span from the ast.
-                let span = ast.kinds.iter().zip(ast.spans.iter()).find_map(|(k, s)| {
-                    if let lw_ast::AstNodeKind::Import { path } = k {
-                        if path == import_path {
-                            return Some(s.clone());
-                        }
-                    }
-                    None
-                });
                 diagnostics.push(Diagnostic {
-                    range: span.unwrap_or_default(),
+                    range: ast.spans[i].clone(),
                     message: format!("import not found: {}", import_path),
                     severity: Severity::Error,
                 });
@@ -103,13 +134,12 @@ pub fn file_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
         }
     }
 
-    // Collect own bindings.
+    // Collect own bindings (detecting duplicates with imported bindings).
     collect_bindings_from(&ast, &mut bindings, &mut diagnostics);
 
     // Check for unknown identifiers.
     check_identifiers_against(&ast, &bindings, &mut diagnostics);
 
-    let _ = text; // keep the read recorded for Salsa
     diagnostics
 }
 

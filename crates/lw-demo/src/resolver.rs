@@ -48,7 +48,7 @@ pub struct ResolvedProgram {
 /// - Reads imported files from `vfs`, parses and lowers them.
 /// - Collects diagnostics for: import not found, duplicate binding, unknown
 ///   identifier.
-pub fn resolve(path: &str, vfs: &Vfs, ast: &AstNodes) -> ResolvedProgram {
+pub fn resolve(_path: &str, vfs: &Vfs, ast: &AstNodes) -> ResolvedProgram {
     let mut bindings: HashMap<String, AstNodeId> = HashMap::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
@@ -64,7 +64,7 @@ pub fn resolve(path: &str, vfs: &Vfs, ast: &AstNodes) -> ResolvedProgram {
                 let imported_source = rope.to_string();
                 let result = parse(&imported_source);
                 let imported_ast = lower(&result.arena, result.root, &imported_source);
-                collect_bindings(&imported_ast, import_path, &mut bindings, &mut diagnostics);
+                collect_bindings_from(&imported_ast, &mut bindings, &mut diagnostics);
             }
             None => {
                 diagnostics.push(Diagnostic {
@@ -77,12 +77,15 @@ pub fn resolve(path: &str, vfs: &Vfs, ast: &AstNodes) -> ResolvedProgram {
     }
 
     // --- collect own bindings (detecting duplicates) ---
-    collect_bindings(ast, path, &mut bindings, &mut diagnostics);
+    collect_bindings_from(ast, &mut bindings, &mut diagnostics);
 
     // --- check for unknown identifiers ---
-    check_identifiers(ast, &bindings, &mut diagnostics);
+    check_identifiers_against(ast, &bindings, &mut diagnostics);
 
-    ResolvedProgram { bindings, diagnostics }
+    ResolvedProgram {
+        bindings,
+        diagnostics,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,9 +94,8 @@ pub fn resolve(path: &str, vfs: &Vfs, ast: &AstNodes) -> ResolvedProgram {
 
 /// Add all top-level let-binding names from `ast` into `bindings`.
 /// Emits a duplicate-binding diagnostic if a name is already present.
-fn collect_bindings(
+pub fn collect_bindings_from(
     ast: &AstNodes,
-    _source_path: &str,
     bindings: &mut HashMap<String, AstNodeId>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -116,7 +118,7 @@ fn collect_bindings(
 
 /// Walk all [`AstNodeKind::Identifier`] nodes and emit a diagnostic for any
 /// name not present in `bindings`.
-fn check_identifiers(
+pub fn check_identifiers_against(
     ast: &AstNodes,
     bindings: &HashMap<String, AstNodeId>,
     diagnostics: &mut Vec<Diagnostic>,

@@ -66,12 +66,13 @@ pub enum TokenKind {
     Whitespace,
 
     /// A `// …` line comment (everything up to, but not including, the newline).
-    // `allow_greedy = true` is required because `[^\n]*` is an unbounded
+    // `allow_greedy = true` is required because `[^\n\r]*` is an unbounded
     // character-class repetition (equivalent to `.*` without newlines).  logos
     // rejects such patterns by default to guard against accidental whole-input
     // consumption; here the intent is deliberate: a comment must consume
-    // everything on the line after `//`.
-    #[regex(r"//[^\n]*", allow_greedy = true)]
+    // everything on the line after `//`.  We exclude `\r` as well as `\n` so
+    // that CRLF line endings are handled cleanly.
+    #[regex(r"//[^\n\r]*", allow_greedy = true)]
     Comment,
 
     // --- sentinels ---
@@ -120,4 +121,103 @@ pub fn lex(source: &str) -> Vec<Token> {
     });
 
     tokens
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collect just the token kinds from a lex result (excluding Eof).
+    fn kinds(source: &str) -> Vec<TokenKind> {
+        lex(source)
+            .into_iter()
+            .map(|t| t.kind)
+            .filter(|k| *k != TokenKind::Eof)
+            .collect()
+    }
+
+    #[test]
+    fn lex_let_binding() {
+        let toks = kinds("let x = 1");
+        assert_eq!(
+            toks,
+            vec![
+                TokenKind::Let,
+                TokenKind::Whitespace,
+                TokenKind::Ident,
+                TokenKind::Whitespace,
+                TokenKind::Equals,
+                TokenKind::Whitespace,
+                TokenKind::IntLiteral,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_import() {
+        let toks = kinds("import \"math.lw\"");
+        assert_eq!(
+            toks,
+            vec![
+                TokenKind::Import,
+                TokenKind::Whitespace,
+                TokenKind::StringLiteral,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_operators() {
+        let toks = kinds("+-*/");
+        assert_eq!(
+            toks,
+            vec![
+                TokenKind::Plus,
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+            ]
+        );
+    }
+
+    #[test]
+    fn lex_comment_and_newline() {
+        let toks = kinds("// hello\nlet x = 1");
+        assert_eq!(toks[0], TokenKind::Comment);
+        assert_eq!(toks[1], TokenKind::Newline);
+        assert_eq!(toks[2], TokenKind::Let);
+    }
+
+    #[test]
+    fn lex_crlf_comment_does_not_consume_newline() {
+        // On Windows, a comment should NOT consume the \r in \r\n.
+        let toks = kinds("// hello\r\nlet");
+        // Comment should end before \r, then we get a newline, then `let`.
+        assert_eq!(toks[0], TokenKind::Comment);
+        assert_eq!(toks[1], TokenKind::Newline);
+        assert_eq!(toks[2], TokenKind::Let);
+    }
+
+    #[test]
+    fn lex_every_byte_is_covered() {
+        let source = "let x = 1 + 2\n";
+        let tokens = lex(source);
+        // All tokens except Eof should cover the entire source.
+        let covered: u32 = tokens
+            .iter()
+            .filter(|t| t.kind != TokenKind::Eof)
+            .map(|t| t.range.end - t.range.start)
+            .sum();
+        assert_eq!(covered, source.len() as u32, "lossless token coverage");
+    }
+
+    #[test]
+    fn lex_unknown_char_produces_error() {
+        let toks = kinds("@");
+        assert_eq!(toks, vec![TokenKind::Error]);
+    }
 }

@@ -1,112 +1,158 @@
 //! `lw-ast` — Abstract Syntax Tree for lang-workbench.
 //!
-//! This crate provides a **columnar / Structure-of-Arrays (SoA)** AST layout.
-//! Rather than a tree of individually-allocated nodes, all data for nodes is
-//! stored in parallel `Vec` columns. This improves cache locality for batch
-//! analysis passes (type checking, dataflow, etc.) and makes serialization to
-//! columnar formats (Parquet, Arrow) straightforward.
+//! # Design: Typed Arenas
 //!
-//! Node identity is a plain [`AstNodeId`] (`u32`) index into the columns.
-//! No lifetime parameters, no allocator references — just `Vec`s.
-//! The storage is WASM-safe.
+//! The AST uses **typed arena indices** rather than a flat untyped ID space.
+//! Each node category (expressions, statements) lives in its own
+//! [`la_arena::Arena`], and references between nodes carry their type in the
+//! index type itself:
+//!
+//! - [`ExprId`] (`Idx<Expr>`) — can only point at an [`Expr`]
+//! - [`StmtId`] (`Idx<Stmt>`) — can only point at a [`Stmt`]
+//!
+//! This means `BinaryExpr { lhs: ExprId, rhs: ExprId }` is **statically
+//! guaranteed** to reference expressions, not arbitrary nodes.  The compiler
+//! rejects code that tries to stick a `StmtId` where an `ExprId` is expected.
+//!
+//! ## Why not a flat columnar/SoA layout?
+//!
+//! A flat `Vec<AstNodeKind>` with `u32` indices is simpler, but:
+//!
+//! 1. **No type safety** — a `u32` can index into any column, so
+//!    `BinaryExpr { lhs: u32 }` could silently point at a `Root` node.
+//! 2. **Error-prone** — lowering must use placeholder-then-patch patterns,
+//!    which can create self-referential cycles on failure.
+//! 3. **Harder to extend** — adding new node categories (types, patterns)
+//!    pollutes a single enum rather than composing separate arenas.
+//!
+//! The typed-arena approach (used by rust-analyzer) avoids all three issues
+//! while remaining cache-friendly (each arena is a contiguous `Vec`).
+//!
+//! ## Error recovery
+//!
+//! [`Expr::Missing`] and [`Stmt::Error`] represent nodes that failed to parse
+//! or lower.  They participate in the tree without creating cycles.
+//!
+//! The storage is WASM-safe: no OS threads, no allocator tricks, just `Vec`s
+//! behind `Arena<T>`.
+
+use la_arena::{Arena, ArenaMap, Idx};
 
 pub use lw_cst::{BinOp, TextRange};
 
-/// Unique node identifier — an index into the [`AstNodes`] columns.
-pub type AstNodeId = u32;
+// ---------------------------------------------------------------------------
+// Typed indices
+// ---------------------------------------------------------------------------
 
-/// The semantic kind of an AST node.
-#[derive(Debug, Clone)]
-pub enum AstNodeKind {
-    /// The root of a source file.
-    Root,
-    /// A `let <name> = <value>` binding.
-    LetBinding { name: String, value: AstNodeId },
-    /// An `import "<path>"` statement.
-    Import { path: String },
-    /// A binary expression.
-    BinaryExpr {
-        op: BinOp,
-        lhs: AstNodeId,
-        rhs: AstNodeId,
-    },
-    /// An integer literal.
-    IntLiteral(i64),
-    /// A floating-point literal.  Equality uses bit-level comparison so that
-    /// this type can be used as a Salsa query result.
-    FloatLiteral(f64),
-    /// An identifier reference.
-    Identifier(String),
-}
+/// A typed index into the expression arena.
+pub type ExprId = Idx<Expr>;
 
-impl PartialEq for AstNodeKind {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Root, Self::Root) => true,
-            (
-                Self::LetBinding {
-                    name: n1,
-                    value: v1,
-                },
-                Self::LetBinding {
-                    name: n2,
-                    value: v2,
-                },
-            ) => n1 == n2 && v1 == v2,
-            (Self::Import { path: p1 }, Self::Import { path: p2 }) => p1 == p2,
-            (
-                Self::BinaryExpr {
-                    op: o1,
-                    lhs: l1,
-                    rhs: r1,
-                },
-                Self::BinaryExpr {
-                    op: o2,
-                    lhs: l2,
-                    rhs: r2,
-                },
-            ) => o1 == o2 && l1 == l2 && r1 == r2,
-            (Self::IntLiteral(a), Self::IntLiteral(b)) => a == b,
-            (Self::FloatLiteral(a), Self::FloatLiteral(b)) => a.to_bits() == b.to_bits(),
-            (Self::Identifier(a), Self::Identifier(b)) => a == b,
-            _ => false,
-        }
-    }
-}
+/// A typed index into the statement arena.
+pub type StmtId = Idx<Stmt>;
 
-impl Eq for AstNodeKind {}
+// ---------------------------------------------------------------------------
+// Expression nodes
+// ---------------------------------------------------------------------------
 
-/// Columnar AST storage. Each index into the `Vec`s is an [`AstNodeId`].
+/// A source-level expression.
 ///
-/// Structure-of-Arrays layout for cache efficiency: all node kinds live
-/// together, all spans live together, etc.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AstNodes {
-    /// The semantic kind of each node.
-    pub kinds: Vec<AstNodeKind>,
-    /// The source span of each node.
-    pub spans: Vec<TextRange>,
-    /// The parent node of each node, if any.
-    pub parents: Vec<Option<AstNodeId>>,
+/// Every variant that references sub-expressions does so via [`ExprId`],
+/// ensuring at the type level that only expressions can appear as children
+/// of an expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expr {
+    /// A binary operation: `lhs op rhs`.
+    Binary { op: BinOp, lhs: ExprId, rhs: ExprId },
+    /// An integer literal (e.g. `42`).
+    IntLiteral(i64),
+    /// An identifier reference (e.g. `pi`).
+    Identifier(String),
+    /// A placeholder for an expression that could not be parsed or lowered.
+    ///
+    /// This is always safe to construct because it has no children — it cannot
+    /// create reference cycles.
+    Missing,
 }
 
-impl AstNodes {
-    /// Creates a new, empty columnar node store.
+// ---------------------------------------------------------------------------
+// Statement nodes
+// ---------------------------------------------------------------------------
+
+/// A source-level statement.
+///
+/// Statements that contain expressions reference them via [`ExprId`],
+/// maintaining the typed boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stmt {
+    /// A `let <name> = <expr>` binding.
+    Let { name: String, value: ExprId },
+    /// An `import "<path>"` declaration.
+    Import { path: String },
+    /// A placeholder for a statement that could not be parsed or lowered.
+    Error,
+}
+
+// ---------------------------------------------------------------------------
+// Ast — the complete tree for one source file
+// ---------------------------------------------------------------------------
+
+/// The complete AST for a single source file.
+///
+/// Expressions and statements live in separate typed arenas.  Source spans are
+/// stored in parallel [`ArenaMap`]s so that the core node types remain small
+/// and cache-friendly, while span information is available when needed (e.g.
+/// for diagnostics and hover).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ast {
+    /// All expressions in this file.
+    pub exprs: Arena<Expr>,
+    /// All statements in this file.
+    pub stmts: Arena<Stmt>,
+    /// The ordered list of top-level statements (execution order).
+    pub top_level: Vec<StmtId>,
+    /// Source spans for expressions, keyed by [`ExprId`].
+    pub expr_ranges: ArenaMap<ExprId, TextRange>,
+    /// Source spans for statements, keyed by [`StmtId`].
+    pub stmt_ranges: ArenaMap<StmtId, TextRange>,
+}
+
+impl Ast {
+    /// Creates a new, empty AST.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Allocates a new node and returns its [`AstNodeId`].
-    pub fn alloc(
-        &mut self,
-        kind: AstNodeKind,
-        span: TextRange,
-        parent: Option<AstNodeId>,
-    ) -> AstNodeId {
-        let id = self.kinds.len() as AstNodeId;
-        self.kinds.push(kind);
-        self.spans.push(span);
-        self.parents.push(parent);
+    /// Allocate an expression and record its source span.
+    pub fn alloc_expr(&mut self, expr: Expr, range: TextRange) -> ExprId {
+        let id = self.exprs.alloc(expr);
+        self.expr_ranges.insert(id, range);
         id
+    }
+
+    /// Allocate a statement and record its source span.
+    pub fn alloc_stmt(&mut self, stmt: Stmt, range: TextRange) -> StmtId {
+        let id = self.stmts.alloc(stmt);
+        self.stmt_ranges.insert(id, range);
+        id
+    }
+
+    /// Look up an expression by ID.
+    pub fn expr(&self, id: ExprId) -> &Expr {
+        &self.exprs[id]
+    }
+
+    /// Look up a statement by ID.
+    pub fn stmt(&self, id: StmtId) -> &Stmt {
+        &self.stmts[id]
+    }
+
+    /// Get the source span of an expression.
+    pub fn expr_range(&self, id: ExprId) -> Option<&TextRange> {
+        self.expr_ranges.get(id)
+    }
+
+    /// Get the source span of a statement.
+    pub fn stmt_range(&self, id: StmtId) -> Option<&TextRange> {
+        self.stmt_ranges.get(id)
     }
 }

@@ -13,11 +13,11 @@ use std::collections::HashMap;
 
 use salsa::Setter;
 
-use lw_ast::AstNodes;
+use lw_ast::{Ast, Stmt, StmtId};
 
 use crate::{
     lower::lower,
-    parser::{ParseResult, parse},
+    parser::parse,
     resolver::{Diagnostic, Severity, check_identifiers_against, collect_bindings_from},
 };
 
@@ -25,9 +25,14 @@ use crate::{
 // Salsa::Update for local types
 // ---------------------------------------------------------------------------
 
-// `file_diagnostics` returns `Vec<Diagnostic>`.  salsa requires the element
+// `file_diagnostics` returns `Vec<Diagnostic>`.  Salsa requires the element
 // type to implement `salsa::Update`.  `Diagnostic` is defined in this crate
 // so the orphan rule permits the impl here.
+//
+// We cannot use `#[derive(salsa::Update)]` because `Diagnostic` contains
+// `TextRange` (from `lw-cst`), and adding a `salsa` dependency to `lw-cst`
+// just for this derive would be inappropriate.  The manual impl is trivially
+// correct for these plain-data types.
 unsafe impl salsa::Update for Diagnostic {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         // SAFETY: caller guarantees old_pointer is valid and aligned.
@@ -67,25 +72,25 @@ pub struct SourceFile {
 ///
 /// Not a Salsa tracked query; call this from within a tracked function so
 /// the read of `file.text(db)` is recorded as a dependency.
-pub fn parse_cst(db: &dyn Db, file: SourceFile) -> ParseResult {
+pub fn parse_cst(db: &dyn Db, file: SourceFile) -> crate::parser::ParseResult {
     let text = file.text(db);
     parse(&text)
 }
 
-/// Lower a source file's CST into an [`AstNodes`] store.
+/// Lower a source file's CST into a typed [`Ast`].
 ///
 /// Not a Salsa tracked query; call this from within a tracked function.
-pub fn lower_ast(db: &dyn Db, file: SourceFile) -> AstNodes {
+pub fn lower_ast(db: &dyn Db, file: SourceFile) -> Ast {
     let text = file.text(db);
     let result = parse(&text);
-    lower(&result.arena, result.root, &text)
+    lower(&result.arena, result.root, &text).ast
 }
 
 // ---------------------------------------------------------------------------
 // Salsa tracked query
 // ---------------------------------------------------------------------------
 
-/// Collect all diagnostics for a file (parse errors + resolution errors).
+/// Collect all diagnostics for a file (parse errors + lower errors + resolution errors).
 ///
 /// This is the only `#[salsa::tracked]` query in the pipeline.  Salsa
 /// records every read of a `SourceFile`'s `text` field that occurs during
@@ -95,7 +100,8 @@ pub fn lower_ast(db: &dyn Db, file: SourceFile) -> AstNodes {
 pub fn file_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     let text = file.text(db);
     let parse_result = parse(&text);
-    let ast = lower(&parse_result.arena, parse_result.root, &text);
+    let lr = lower(&parse_result.arena, parse_result.root, &text);
+    let ast = &lr.ast;
 
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
@@ -108,25 +114,36 @@ pub fn file_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
         });
     }
 
-    let mut bindings = HashMap::new();
+    // Convert lowering errors to diagnostics.
+    for e in &lr.errors {
+        diagnostics.push(Diagnostic {
+            range: e.range.clone(),
+            message: e.message.clone(),
+            severity: Severity::Error,
+        });
+    }
+
+    let mut bindings: HashMap<String, StmtId> = HashMap::new();
 
     // Resolve imports — reading each imported file's text establishes a Salsa
     // dependency, so changes to imported files propagate here automatically.
-    for (i, kind) in ast.kinds.iter().enumerate() {
-        let lw_ast::AstNodeKind::Import { path: import_path } = kind else {
+    for &stmt_id in &ast.top_level {
+        let Stmt::Import { path: import_path } = ast.stmt(stmt_id) else {
             continue;
         };
-        match db.file_for_path(import_path) {
+        let import_path = import_path.clone();
+        match db.file_for_path(&import_path) {
             Some(imported_file) => {
                 let imported_text = imported_file.text(db);
                 let imported_result = parse(&imported_text);
-                let imported_ast =
+                let imported_lr =
                     lower(&imported_result.arena, imported_result.root, &imported_text);
-                collect_bindings_from(&imported_ast, &mut bindings, &mut diagnostics);
+                collect_bindings_from(&imported_lr.ast, &mut bindings, &mut diagnostics);
             }
             None => {
+                let span = ast.stmt_range(stmt_id).cloned().unwrap_or_default();
                 diagnostics.push(Diagnostic {
-                    range: ast.spans[i].clone(),
+                    range: span,
                     message: format!("import not found: {}", import_path),
                     severity: Severity::Error,
                 });
@@ -135,10 +152,10 @@ pub fn file_diagnostics(db: &dyn Db, file: SourceFile) -> Vec<Diagnostic> {
     }
 
     // Collect own bindings (detecting duplicates with imported bindings).
-    collect_bindings_from(&ast, &mut bindings, &mut diagnostics);
+    collect_bindings_from(ast, &mut bindings, &mut diagnostics);
 
     // Check for unknown identifiers.
-    check_identifiers_against(&ast, &bindings, &mut diagnostics);
+    check_identifiers_against(ast, &bindings, &mut diagnostics);
 
     diagnostics
 }

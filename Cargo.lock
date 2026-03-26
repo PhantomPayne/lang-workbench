@@ -669,6 +669,7 @@ dependencies = [
 name = "lw-ast"
 version = "0.1.0"
 dependencies = [
+ "la-arena",
  "lw-cst",
 ]
 
@@ -684,7 +685,6 @@ name = "lw-demo"
 version = "0.1.0"
 dependencies = [
  "logos",
- "lw-analysis",
  "lw-ast",
  "lw-cst",
  "lw-vfs",

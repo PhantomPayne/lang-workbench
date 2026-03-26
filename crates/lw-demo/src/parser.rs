@@ -94,7 +94,18 @@ impl<'src> Parser<'src> {
         }
     }
 
-    // --- expression parsing (precedence climbing) ---
+    // --- expression parsing ---
+    //
+    // All binary operators currently have the same precedence and associate
+    // left-to-right.  Precedence levels (e.g. `*`/`/` > `+`/`-`) can be
+    // added later via precedence climbing or a Pratt parser.
+    //
+    // Note: trivia (whitespace, comments) between operands and operators is
+    // consumed but not emitted as CST nodes inside expressions.  The CST is
+    // lossless at the *top level* (between statements), but trivia inside
+    // compound nodes like LetBinding and BinaryExpr is currently not tracked.
+    // This is a known limitation — full inner-trivia tracking requires either
+    // a red-green tree or an explicit children list per node.
 
     fn parse_primary(&mut self) -> Option<CstNodeId> {
         match self.current_kind().clone() {
@@ -337,5 +348,133 @@ pub fn parse(source: &str) -> ParseResult {
         arena: p.arena,
         root,
         errors: p.errors,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_let_binding() {
+        let result = parse("let x = 1");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let root = result.arena.get(result.root);
+        let CstNode::Root { children } = root else {
+            panic!("expected Root");
+        };
+        let non_trivia: Vec<_> = children
+            .iter()
+            .filter(|&&id| {
+                !matches!(
+                    result.arena.get(id),
+                    CstNode::Whitespace { .. } | CstNode::Comment { .. }
+                )
+            })
+            .collect();
+        assert_eq!(non_trivia.len(), 1);
+        assert!(matches!(
+            result.arena.get(*non_trivia[0]),
+            CstNode::LetBinding { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_binary_expr() {
+        let result = parse("let y = 1 + 2 * 3");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn parse_import() {
+        let result = parse("import \"std.lw\"");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+        let root = result.arena.get(result.root);
+        let CstNode::Root { children } = root else {
+            panic!("expected Root");
+        };
+        let non_trivia: Vec<_> = children
+            .iter()
+            .filter(|&&id| {
+                !matches!(
+                    result.arena.get(id),
+                    CstNode::Whitespace { .. } | CstNode::Comment { .. }
+                )
+            })
+            .collect();
+        assert_eq!(non_trivia.len(), 1);
+        assert!(matches!(
+            result.arena.get(*non_trivia[0]),
+            CstNode::Import { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_error_recovery_at_top_level() {
+        let result = parse("@ let x = 1");
+        // Should recover and still parse the let binding.
+        assert!(!result.errors.is_empty());
+
+        let root = result.arena.get(result.root);
+        let CstNode::Root { children } = root else {
+            panic!("expected Root");
+        };
+        // Should have at least an Error node and a LetBinding.
+        let has_error = children
+            .iter()
+            .any(|&id| matches!(result.arena.get(id), CstNode::Error { .. }));
+        let has_let = children
+            .iter()
+            .any(|&id| matches!(result.arena.get(id), CstNode::LetBinding { .. }));
+        assert!(has_error, "expected an error node");
+        assert!(has_let, "expected a let binding after recovery");
+    }
+
+    #[test]
+    fn parse_preserves_trivia_between_statements() {
+        let result = parse("let x = 1\n\nlet y = 2");
+        assert!(result.errors.is_empty());
+
+        let root = result.arena.get(result.root);
+        let CstNode::Root { children } = root else {
+            panic!("expected Root");
+        };
+        let trivia_count = children
+            .iter()
+            .filter(|&&id| {
+                matches!(
+                    result.arena.get(id),
+                    CstNode::Whitespace { .. } | CstNode::Comment { .. }
+                )
+            })
+            .count();
+        assert!(trivia_count > 0, "expected trivia nodes between statements");
+    }
+
+    #[test]
+    fn parse_multiple_statements() {
+        let result = parse("let a = 1\nlet b = 2\nlet c = 3");
+        assert!(result.errors.is_empty());
+
+        let root = result.arena.get(result.root);
+        let CstNode::Root { children } = root else {
+            panic!("expected Root");
+        };
+        let stmts = children
+            .iter()
+            .filter(|&&id| {
+                matches!(
+                    result.arena.get(id),
+                    CstNode::LetBinding { .. } | CstNode::Import { .. }
+                )
+            })
+            .count();
+        assert_eq!(stmts, 3);
     }
 }

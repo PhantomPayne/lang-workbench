@@ -15,11 +15,11 @@
 //! The pipeline is:
 //!
 //! ```text
-//! source text → lexer → parser → CstArena  → lower → AstNodes
-//!                                                   ↓
-//!                                             resolver (cross-file)
-//!                                                   ↓
-//!                                             diagnostics (Salsa)
+//! source text → lexer → parser → CstArena → lower → Ast (typed arenas)
+//!                                                  ↓
+//!                                            resolver (cross-file)
+//!                                                  ↓
+//!                                            diagnostics (Salsa)
 //! ```
 
 pub mod lexer;

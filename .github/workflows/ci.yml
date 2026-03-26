@@ -26,6 +26,7 @@ jobs:
       - name: Clippy
         run: >
           cargo clippy
+          --locked
           --workspace
           --exclude lw-lsp-wasm
           --exclude lw-wasm
@@ -35,6 +36,7 @@ jobs:
       - name: Tests
         run: >
           cargo test
+          --locked
           --workspace
           --exclude lw-lsp-wasm
           --exclude lw-wasm
@@ -53,23 +55,23 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
-        run: cargo install wasm-pack
+        run: cargo install wasm-pack --version 0.13.1 --locked
 
       # lw-lsp-native is intentionally excluded — it uses tokio and tower-lsp which are native-only
       - name: Build lw-vfs for WASM
-        run: cargo build --target wasm32-unknown-unknown -p lw-vfs
+        run: cargo build --locked --target wasm32-unknown-unknown -p lw-vfs
 
       - name: Build lw-cst for WASM
-        run: cargo build --target wasm32-unknown-unknown -p lw-cst
+        run: cargo build --locked --target wasm32-unknown-unknown -p lw-cst
 
       - name: Build lw-ast for WASM
-        run: cargo build --target wasm32-unknown-unknown -p lw-ast
+        run: cargo build --locked --target wasm32-unknown-unknown -p lw-ast
 
       - name: Build lw-analysis for WASM
-        run: cargo build --target wasm32-unknown-unknown -p lw-analysis
+        run: cargo build --locked --target wasm32-unknown-unknown -p lw-analysis
 
       - name: Build lw-lsp-core for WASM
-        run: cargo build --target wasm32-unknown-unknown -p lw-lsp-core
+        run: cargo build --locked --target wasm32-unknown-unknown -p lw-lsp-core
 
       - name: wasm-pack build lw-lsp-wasm
         run: wasm-pack build crates/lw-lsp-wasm --target web

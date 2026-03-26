@@ -36,7 +36,7 @@ impl Compiler {
 
     /// Opens (or replaces) a file in the VFS with the given source text.
     pub fn open_file(&mut self, path: &str, text: &str) {
-        self.service.vfs.open(path, text);
+        self.service.open_file(path, text);
     }
 
     /// Parses the given file and returns a stub JSON representation of the

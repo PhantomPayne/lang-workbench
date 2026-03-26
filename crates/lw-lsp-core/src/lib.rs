@@ -8,7 +8,7 @@
 //! **No transport, no async runtime, no `tokio`, no `tower`.** This makes the
 //! crate safe to compile to `wasm32-unknown-unknown` and reuse verbatim in:
 //!
-//! * `lw-lsp-native` — wraps this with a `tower-lsp` stdio/TCP transport.
+//! * `lw-lsp-native` — wraps this with a `tower-lsp` stdio transport.
 //! * `lw-lsp-wasm` — wraps this with a `postMessage` Web Worker transport.
 
 use lsp_types::{Diagnostic, Hover, Position};
@@ -21,8 +21,8 @@ use lw_vfs::Vfs;
 /// (`lw-lsp-native`, `lw-lsp-wasm`) hold a `LanguageService` and delegate
 /// all semantic work to it.
 pub struct LanguageService {
-    pub vfs: Vfs,
-    pub db: Database,
+    vfs: Vfs,
+    db: Database,
 }
 
 impl Default for LanguageService {
@@ -40,6 +40,31 @@ impl LanguageService {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // VFS delegation
+    // -----------------------------------------------------------------------
+
+    /// Opens (or replaces) a file in the VFS with the given source text.
+    pub fn open_file(&self, path: &str, text: &str) {
+        self.vfs.open(path, text);
+    }
+
+    /// Closes a file, removing it from the VFS.
+    pub fn close_file(&self, path: &str) {
+        self.vfs.close(path);
+    }
+
+    /// Applies an incremental text change to an open file.
+    ///
+    /// See [`lw_vfs::Vfs::apply_change`] for range semantics and return value.
+    pub fn apply_change(&self, path: &str, range: (usize, usize), new_text: &str) -> bool {
+        self.vfs.apply_change(path, range, new_text)
+    }
+
+    // -----------------------------------------------------------------------
+    // LSP queries
+    // -----------------------------------------------------------------------
+
     /// Returns a list of diagnostics for the given file path.
     ///
     /// Stub implementation — always returns an empty list.
@@ -53,5 +78,16 @@ impl LanguageService {
     /// Stub implementation — always returns `None`.
     pub fn get_hover(&self, _path: &str, _position: Position) -> Option<Hover> {
         None
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal access (crate-only)
+    // -----------------------------------------------------------------------
+
+    /// Returns a reference to the underlying [`Database`] for use by analysis
+    /// code within this crate.
+    #[allow(dead_code)]
+    fn db(&self) -> &Database {
+        &self.db
     }
 }

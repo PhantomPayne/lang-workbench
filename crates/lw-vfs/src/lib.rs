@@ -49,12 +49,24 @@ impl Vfs {
     /// `range` is a pair of `(start_char, end_char)` character offsets.
     /// The text between those offsets is replaced with `new_text`.
     ///
-    /// Returns `false` if the file is not open.
+    /// Returns `false` if the file is not open or if the range is invalid.
     pub fn apply_change(&self, path: &str, range: (usize, usize), new_text: &str) -> bool {
         let Some(mut rope) = self.files.get_mut(path) else {
             return false;
         };
-        let (start, end) = range;
+        let (start, mut end) = range;
+        // Reject obviously invalid ranges.
+        if start > end {
+            return false;
+        }
+        let len = rope.len_chars();
+        if start > len {
+            return false;
+        }
+        // Clamp the end of the range to the current document length.
+        if end > len {
+            end = len;
+        }
         rope.remove(start..end);
         rope.insert(start, new_text);
         true

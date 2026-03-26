@@ -1,4 +1,4 @@
-//! `lw-lsp-native` — native stdio/TCP transport for the lang-workbench LSP.
+//! `lw-lsp-native` — native stdio transport for the lang-workbench LSP.
 //!
 //! This crate is **native-only** — it should never be compiled to WASM or
 //! added to WASM CI. It wires [`lw_lsp_core::LanguageService`] up to a

@@ -1,0 +1,13 @@
+[package]
+name = "lw-lsp-native"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lw-lsp-native"
+path = "src/main.rs"
+
+[dependencies]
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
+lw-lsp-core = { path = "../lw-lsp-core" }

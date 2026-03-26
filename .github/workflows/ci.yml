@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  native:
+    name: Native (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: >
+          cargo clippy
+          --workspace
+          --exclude lw-lsp-wasm
+          --exclude lw-wasm
+          --all-targets
+          -- -D warnings
+
+      - name: Tests
+        run: >
+          cargo test
+          --workspace
+          --exclude lw-lsp-wasm
+          --exclude lw-wasm
+
+  wasm:
+    name: WASM build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + wasm32-unknown-unknown)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack
+
+      # lw-lsp-native is intentionally excluded — it uses tokio and tower-lsp which are native-only
+      - name: Build lw-vfs for WASM
+        run: cargo build --target wasm32-unknown-unknown -p lw-vfs
+
+      - name: Build lw-cst for WASM
+        run: cargo build --target wasm32-unknown-unknown -p lw-cst
+
+      - name: Build lw-ast for WASM
+        run: cargo build --target wasm32-unknown-unknown -p lw-ast
+
+      - name: Build lw-analysis for WASM
+        run: cargo build --target wasm32-unknown-unknown -p lw-analysis
+
+      - name: Build lw-lsp-core for WASM
+        run: cargo build --target wasm32-unknown-unknown -p lw-lsp-core
+
+      - name: wasm-pack build lw-lsp-wasm
+        run: wasm-pack build crates/lw-lsp-wasm --target web
+
+      - name: wasm-pack build lw-wasm
+        run: wasm-pack build crates/lw-wasm --target web

@@ -1,0 +1,9 @@
+[package]
+name = "lw-lsp-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lsp-types = "0.95"
+lw-vfs = { path = "../lw-vfs" }
+lw-analysis = { path = "../lw-analysis" }

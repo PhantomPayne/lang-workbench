@@ -1,0 +1,12 @@
+[workspace]
+members = [
+  "crates/lw-vfs",
+  "crates/lw-cst",
+  "crates/lw-ast",
+  "crates/lw-analysis",
+  "crates/lw-lsp-core",
+  "crates/lw-lsp-native",
+  "crates/lw-lsp-wasm",
+  "crates/lw-wasm",
+]
+resolver = "2"

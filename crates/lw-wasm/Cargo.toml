@@ -1,0 +1,15 @@
+[package]
+name = "lw-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+lw-vfs = { path = "../lw-vfs" }
+lw-cst = { path = "../lw-cst" }
+lw-ast = { path = "../lw-ast" }
+lw-analysis = { path = "../lw-analysis" }
+lw-lsp-core = { path = "../lw-lsp-core" }

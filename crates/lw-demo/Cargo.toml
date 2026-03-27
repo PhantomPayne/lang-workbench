@@ -1,0 +1,13 @@
+[package]
+name = "lw-demo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lw-vfs = { path = "../lw-vfs" }
+lw-cst = { path = "../lw-cst" }
+lw-ast = { path = "../lw-ast" }
+logos = "0.16"
+salsa = "0.26"
+
+[dev-dependencies]

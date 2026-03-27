@@ -11,13 +11,14 @@ A modular compiler engineering workbench built in Rust.
 | Crate | Description |
 |---|---|
 | [`lw-vfs`](crates/lw-vfs) | Virtual file system — in-memory file store backed by `dashmap` + `ropey`. WASM-safe. |
-| [`lw-cst`](crates/lw-cst) | Concrete Syntax Tree — lossless, full-fidelity, arena-allocated with `bumpalo`. WASM-safe. |
-| [`lw-ast`](crates/lw-ast) | Abstract Syntax Tree — columnar / SoA layout, arena-allocated with `bumpalo`. WASM-safe. |
+| [`lw-cst`](crates/lw-cst) | Concrete Syntax Tree — Data-Oriented flat token ledger (`CstArena`), `LineIndex` for LSP positions, tree nodes in flat `Vec`. WASM-safe. |
+| [`lw-ast`](crates/lw-ast) | Abstract Syntax Tree — typed flat arrays (`Expr`/`Stmt` with `ExprId`/`StmtId` newtypes), parallel span storage. WASM-safe. |
 | [`lw-analysis`](crates/lw-analysis) | Incremental analyses — Salsa queries + Ascent datalog rules. WASM-safe. |
 | [`lw-lsp-core`](crates/lw-lsp-core) | LSP logic layer — diagnostics, hover, completions; no transport, no async runtime. WASM-safe. |
 | [`lw-lsp-native`](crates/lw-lsp-native) | Native LSP server — wraps `lw-lsp-core` with `tower-lsp` + `tokio` stdio transport. **Native only.** |
 | [`lw-lsp-wasm`](crates/lw-lsp-wasm) | WASM LSP server — wraps `lw-lsp-core` with a `postMessage` Web Worker transport. **WASM only.** |
 | [`lw-wasm`](crates/lw-wasm) | Direct JS/TS API — `wasm-bindgen` facade over all core crates; no LSP protocol. **WASM only.** |
+| [`lw-demo`](crates/lw-demo) | End-to-end demo pipeline — lexer (logos), parser, typed AST, resolver, Salsa incremental. |
 
 ---
 

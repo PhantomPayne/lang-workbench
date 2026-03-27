@@ -1,62 +1,157 @@
-//! `lw-ast` — Abstract Syntax Tree for lang-workbench.
+//! `lw-ast` — Data-Oriented Abstract Syntax Tree for lang-workbench.
 //!
-//! This crate provides a **columnar / Structure-of-Arrays (SoA)** AST layout.
-//! Rather than a tree of individually-allocated nodes, all data for nodes of a
-//! given kind is stored in parallel `Vec` columns. This improves cache
-//! locality for batch analysis passes (type checking, dataflow, etc.) and
-//! makes serialization to columnar formats (Parquet, Arrow) straightforward.
+//! # Design: Flat Typed Arrays
 //!
-//! The arena is allocated via [`bumpalo::Bump`] and is WASM-safe.
+//! The AST uses **typed newtype indices** over flat `Vec`s — no `Box`, `Rc`,
+//! `RefCell`, or lifetimes.  Each node category (expressions, statements)
+//! lives in its own `Vec`, and references between nodes carry their type in
+//! the index wrapper:
+//!
+//! - [`ExprId`] — can only index into `Ast::exprs`
+//! - [`StmtId`] — can only index into `Ast::stmts`
+//!
+//! This means `Binary { lhs: ExprId, rhs: ExprId }` is statically guaranteed
+//! to reference expressions, not arbitrary nodes.
+//!
+//! ## Span storage
+//!
+//! Source spans are stored in parallel `Vec`s (`expr_spans`, `stmt_spans`)
+//! using [`TokenSpan`] — a packed (token-index, count) pair.  No line or
+//! column numbers are stored in nodes; LSP positions are computed on demand
+//! via [`lw_cst::LineIndex`].
+//!
+//! ## Error recovery
+//!
+//! [`Expr::Missing`] and [`Stmt::Error`] represent nodes that failed to parse
+//! or lower.  They are leaf nodes with no children, so they cannot create
+//! reference cycles.
 
-use bumpalo::Bump;
+pub use lw_cst::{BinOp, TokenSpan};
 
-/// Arena that owns all AST storage for a single compilation unit.
+// ---------------------------------------------------------------------------
+// Typed indices
+// ---------------------------------------------------------------------------
+
+/// A typed index into `Ast::exprs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExprId(pub u32);
+
+/// A typed index into `Ast::stmts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StmtId(pub u32);
+
+// ---------------------------------------------------------------------------
+// Expression nodes
+// ---------------------------------------------------------------------------
+
+/// A source-level expression.
 ///
-/// In the columnar model the arena itself does not allocate individual nodes;
-/// instead it backs the [`AstNodes`] column vectors.
-pub struct AstArena {
-    bump: Bump,
+/// Every variant that references sub-expressions does so via [`ExprId`],
+/// ensuring at the type level that only expressions can appear as children
+/// of an expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Expr {
+    /// A binary operation: `lhs op rhs`.
+    Binary { op: BinOp, lhs: ExprId, rhs: ExprId },
+    /// An integer literal (e.g. `42`).
+    IntLiteral(i64),
+    /// An identifier reference (e.g. `pi`).
+    Identifier(String),
+    /// A placeholder for an expression that could not be parsed or lowered.
+    ///
+    /// This is always safe to construct because it has no children — it cannot
+    /// create reference cycles.
+    Missing,
 }
 
-impl Default for AstArena {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ---------------------------------------------------------------------------
+// Statement nodes
+// ---------------------------------------------------------------------------
 
-impl AstArena {
-    /// Creates a new, empty AST arena.
-    pub fn new() -> Self {
-        Self { bump: Bump::new() }
-    }
-
-    /// Returns a reference to the underlying bump allocator.
-    pub fn bump(&self) -> &Bump {
-        &self.bump
-    }
-}
-
-/// Columnar storage for AST nodes (Structure-of-Arrays layout).
+/// A source-level statement.
 ///
-/// Each field is a parallel column: `id[i]` and `span_start[i]` / `span_end[i]`
-/// all describe the same node `i`. New columns can be added for additional
-/// node metadata without changing the node identity encoding.
-///
-/// This is a placeholder. Future columns will cover node kind, parent index,
-/// type annotation, etc.
-#[derive(Debug, Default)]
-pub struct AstNodes {
-    /// Unique numeric identifiers for each node.
-    pub id: Vec<u32>,
-    /// Start byte offsets of each node's source span.
-    pub span_start: Vec<u32>,
-    /// End byte offsets of each node's source span.
-    pub span_end: Vec<u32>,
+/// Statements that contain expressions reference them via [`ExprId`],
+/// maintaining the typed boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stmt {
+    /// A `let <name> = <expr>` binding.
+    Let { name: String, value: ExprId },
+    /// An `import "<path>"` declaration.
+    Import { path: String },
+    /// A placeholder for a statement that could not be parsed or lowered.
+    Error,
 }
 
-impl AstNodes {
-    /// Creates a new, empty columnar node store.
+// ---------------------------------------------------------------------------
+// Ast — the complete tree for one source file
+// ---------------------------------------------------------------------------
+
+/// The complete AST for a single source file.
+///
+/// All data is stored in flat `Vec`s.  Source spans are stored in parallel
+/// arrays keyed by the same index, so the core node types remain small and
+/// cache-friendly while span information is available when needed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ast {
+    /// All expressions in this file (indexed by [`ExprId`]).
+    pub exprs: Vec<Expr>,
+    /// All statements in this file (indexed by [`StmtId`]).
+    pub stmts: Vec<Stmt>,
+    /// The ordered list of top-level statements (execution order).
+    pub top_level: Vec<StmtId>,
+    /// Source spans for expressions, parallel to `exprs`.
+    pub expr_spans: Vec<TokenSpan>,
+    /// Source spans for statements, parallel to `stmts`.
+    pub stmt_spans: Vec<TokenSpan>,
+}
+
+impl Ast {
+    /// Creates a new, empty AST.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Allocate an expression and record its source span.
+    pub fn alloc_expr(&mut self, expr: Expr, span: TokenSpan) -> ExprId {
+        let id = ExprId(self.exprs.len() as u32);
+        self.exprs.push(expr);
+        self.expr_spans.push(span);
+        id
+    }
+
+    /// Allocate a statement and record its source span.
+    pub fn alloc_stmt(&mut self, stmt: Stmt, span: TokenSpan) -> StmtId {
+        let id = StmtId(self.stmts.len() as u32);
+        self.stmts.push(stmt);
+        self.stmt_spans.push(span);
+        id
+    }
+
+    /// Look up an expression by ID.
+    pub fn expr(&self, id: ExprId) -> &Expr {
+        &self.exprs[id.0 as usize]
+    }
+
+    /// Look up a statement by ID.
+    pub fn stmt(&self, id: StmtId) -> &Stmt {
+        &self.stmts[id.0 as usize]
+    }
+
+    /// Get the source span of an expression.
+    pub fn expr_span(&self, id: ExprId) -> &TokenSpan {
+        &self.expr_spans[id.0 as usize]
+    }
+
+    /// Get the source span of a statement.
+    pub fn stmt_span(&self, id: StmtId) -> &TokenSpan {
+        &self.stmt_spans[id.0 as usize]
+    }
+
+    /// Iterate over all expressions with their IDs.
+    pub fn iter_exprs(&self) -> impl Iterator<Item = (ExprId, &Expr)> {
+        self.exprs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (ExprId(i as u32), e))
     }
 }

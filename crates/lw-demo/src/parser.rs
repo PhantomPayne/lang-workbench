@@ -140,7 +140,6 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> CstNodeId {
-        let start_pos = self.pos;
         let mut lhs = match self.parse_primary() {
             Some(id) => id,
             None => {
@@ -191,7 +190,6 @@ impl Parser {
                 })
             });
 
-            let _ = start_pos; // suppress unused warning
             lhs = self.tree.alloc(CstNode::BinaryExpr { op, lhs, rhs });
         }
 

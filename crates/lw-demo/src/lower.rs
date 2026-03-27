@@ -1,24 +1,23 @@
 //! CST → AST lowering for the `lw-demo` language.
 //!
 //! Strips trivia (whitespace, comments) and maps [`CstNode`]s into the typed
-//! [`Ast`] representation.  Because the AST uses typed arenas ([`ExprId`],
-//! [`StmtId`]), lowering is straightforward — no placeholder-then-patch
-//! pattern is needed.
+//! [`Ast`] representation.  Because the AST uses typed indices ([`ExprId`],
+//! [`StmtId`]), lowering is straightforward — children are lowered first,
+//! then the parent is allocated with real IDs.
 //!
 //! # Error handling
 //!
-//! - Trivia and CST error nodes are silently dropped (they don't appear in
-//!   the AST).
+//! - Trivia and CST error nodes are silently dropped.
 //! - If a literal cannot be parsed (e.g. integer overflow), the lowerer
 //!   emits [`Expr::Missing`] and records a [`LowerError`].
 
-use lw_ast::{Ast, Expr, ExprId, Stmt, StmtId, TextRange};
-use lw_cst::{CstArena, CstNode, CstNodeId};
+use lw_ast::{Ast, Expr, ExprId, Stmt, StmtId, TokenSpan};
+use lw_cst::{CstArena, CstNode, CstNodeId, CstTree};
 
 /// An error produced during CST → AST lowering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LowerError {
-    pub range: TextRange,
+    pub span: TokenSpan,
     pub message: String,
 }
 
@@ -31,12 +30,12 @@ pub struct LowerResult {
 
 /// Lower a parsed CST into a typed [`Ast`].
 ///
-/// `source` is the original source text, needed to extract string slices for
-/// identifier names, import paths, and literal values.
-pub fn lower(arena: &CstArena, root: CstNodeId, source: &str) -> LowerResult {
+/// `arena` is the token ledger (needed to extract text for identifiers,
+/// literals, and import paths).
+pub fn lower(arena: &CstArena, tree: &CstTree, root: CstNodeId) -> LowerResult {
     let mut ctx = LowerCtx {
         arena,
-        source,
+        tree,
         ast: Ast::new(),
         errors: Vec::new(),
     };
@@ -53,14 +52,14 @@ pub fn lower(arena: &CstArena, root: CstNodeId, source: &str) -> LowerResult {
 
 struct LowerCtx<'a> {
     arena: &'a CstArena,
-    source: &'a str,
+    tree: &'a CstTree,
     ast: Ast,
     errors: Vec<LowerError>,
 }
 
 impl LowerCtx<'_> {
     fn lower_root(&mut self, id: CstNodeId) {
-        let CstNode::Root { children } = self.arena.get(id) else {
+        let CstNode::Root { children } = self.tree.get(id) else {
             return;
         };
         let children = children.clone();
@@ -72,46 +71,45 @@ impl LowerCtx<'_> {
     }
 
     fn lower_stmt(&mut self, id: CstNodeId) -> Option<StmtId> {
-        match self.arena.get(id) {
+        match self.tree.get(id) {
             CstNode::LetBinding { name, value } => {
-                let name = name.clone();
-                let value = *value;
-                let name_str = self.slice(&name).to_string();
-                let value_id = self.lower_expr(value);
+                let name_span = *name;
+                let value_id = *value;
+                let name_str = self.arena.span_text(&name_span).to_string();
+                let value_expr = self.lower_expr(value_id);
                 Some(self.ast.alloc_stmt(
                     Stmt::Let {
                         name: name_str,
-                        value: value_id,
+                        value: value_expr,
                     },
-                    name,
+                    name_span,
                 ))
             }
             CstNode::Import { path } => {
-                let path = path.clone();
-                let raw = self.slice(&path);
+                let path_span = *path;
+                let raw = self.arena.span_text(&path_span);
                 let path_str = if raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2 {
                     raw[1..raw.len() - 1].to_string()
                 } else {
                     raw.to_string()
                 };
-                Some(self.ast.alloc_stmt(Stmt::Import { path: path_str }, path))
+                Some(
+                    self.ast
+                        .alloc_stmt(Stmt::Import { path: path_str }, path_span),
+                )
             }
             // Trivia and errors are stripped.
             CstNode::Whitespace { .. } | CstNode::Comment { .. } | CstNode::Error { .. } => None,
-            // Expressions, literals, identifiers at statement level are not
-            // valid top-level forms in this language — skip them.
             _ => None,
         }
     }
 
     fn lower_expr(&mut self, id: CstNodeId) -> ExprId {
-        match self.arena.get(id) {
+        match self.tree.get(id) {
             CstNode::BinaryExpr { op, lhs, rhs } => {
-                let op = op.clone();
+                let op = *op;
                 let lhs = *lhs;
                 let rhs = *rhs;
-                // Lower children first — no placeholders needed because
-                // ExprId is returned directly by lower_expr.
                 let lhs_id = self.lower_expr(lhs);
                 let rhs_id = self.lower_expr(rhs);
                 self.ast.alloc_expr(
@@ -120,58 +118,48 @@ impl LowerCtx<'_> {
                         lhs: lhs_id,
                         rhs: rhs_id,
                     },
-                    TextRange::default(),
+                    TokenSpan::default(),
                 )
             }
             CstNode::Literal {
                 kind: lw_cst::LiteralKind::Integer,
-                range,
+                span,
             } => {
-                let range = range.clone();
-                let text = self.slice(&range);
+                let span = *span;
+                let text = self.arena.span_text(&span);
                 match text.parse::<i64>() {
-                    Ok(value) => self.ast.alloc_expr(Expr::IntLiteral(value), range),
+                    Ok(value) => self.ast.alloc_expr(Expr::IntLiteral(value), span),
                     Err(e) => {
                         self.errors.push(LowerError {
-                            range: range.clone(),
+                            span,
                             message: format!("invalid integer literal: {e}"),
                         });
-                        self.ast.alloc_expr(Expr::Missing, range)
+                        self.ast.alloc_expr(Expr::Missing, span)
                     }
                 }
             }
             CstNode::Literal {
                 kind: lw_cst::LiteralKind::Float,
-                range,
+                span,
             } => {
-                let range = range.clone();
-                // Float literals are not currently part of the language spec.
-                // Emit Missing and report an error.
+                let span = *span;
                 self.errors.push(LowerError {
-                    range: range.clone(),
+                    span,
                     message: "float literals are not supported".to_string(),
                 });
-                self.ast.alloc_expr(Expr::Missing, range)
+                self.ast.alloc_expr(Expr::Missing, span)
             }
-            CstNode::Identifier { range } => {
-                let range = range.clone();
-                let name = self.slice(&range).to_string();
-                self.ast.alloc_expr(Expr::Identifier(name), range)
+            CstNode::Identifier { span } => {
+                let span = *span;
+                let name = self.arena.span_text(&span).to_string();
+                self.ast.alloc_expr(Expr::Identifier(name), span)
             }
-            // Trivia nodes can appear when the CST has them as children of
-            // compound nodes — just produce Missing.
-            CstNode::Error { range, .. } => {
-                let range = range.clone();
-                self.ast.alloc_expr(Expr::Missing, range)
+            CstNode::Error { span, .. } => {
+                let span = *span;
+                self.ast.alloc_expr(Expr::Missing, span)
             }
-            _ => self.ast.alloc_expr(Expr::Missing, TextRange::default()),
+            _ => self.ast.alloc_expr(Expr::Missing, TokenSpan::default()),
         }
-    }
-
-    fn slice(&self, range: &TextRange) -> &str {
-        let start = range.start as usize;
-        let end = (range.end as usize).min(self.source.len());
-        &self.source[start..end]
     }
 }
 
@@ -187,7 +175,7 @@ mod tests {
     #[test]
     fn lower_integer_literal() {
         let result = parse("let x = 42");
-        let lr = lower(&result.arena, result.root, "let x = 42");
+        let lr = lower(&result.arena, &result.tree, result.root);
         assert!(lr.errors.is_empty());
         assert_eq!(lr.ast.top_level.len(), 1);
 
@@ -204,7 +192,7 @@ mod tests {
     #[test]
     fn lower_binary_expr_has_typed_children() {
         let result = parse("let y = 1 + 2");
-        let lr = lower(&result.arena, result.root, "let y = 1 + 2");
+        let lr = lower(&result.arena, &result.tree, result.root);
         assert!(lr.errors.is_empty());
 
         let stmt = lr.ast.stmt(lr.ast.top_level[0]);
@@ -214,17 +202,15 @@ mod tests {
         let Expr::Binary { lhs, rhs, .. } = lr.ast.expr(*value) else {
             panic!("expected Binary");
         };
-        // lhs and rhs are ExprId — they can only point at Expr nodes.
         assert_eq!(lr.ast.expr(*lhs), &Expr::IntLiteral(1));
         assert_eq!(lr.ast.expr(*rhs), &Expr::IntLiteral(2));
     }
 
     #[test]
     fn lower_integer_overflow_produces_missing_and_error() {
-        // A 30-digit number will overflow i64.
         let src = "let big = 999999999999999999999999999999";
         let result = parse(src);
-        let lr = lower(&result.arena, result.root, src);
+        let lr = lower(&result.arena, &result.tree, result.root);
         assert!(!lr.errors.is_empty(), "expected a lowering error");
         assert!(lr.errors[0].message.contains("invalid integer literal"));
 
@@ -238,7 +224,7 @@ mod tests {
     #[test]
     fn lower_import() {
         let result = parse("import \"math.lw\"");
-        let lr = lower(&result.arena, result.root, "import \"math.lw\"");
+        let lr = lower(&result.arena, &result.tree, result.root);
         assert!(lr.errors.is_empty());
         let stmt = lr.ast.stmt(lr.ast.top_level[0]);
         assert_eq!(

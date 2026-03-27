@@ -1,7 +1,7 @@
 //! Integration tests for the full `lw-demo` pipeline.
 //!
-//! Tests exercise the complete pipeline: source → lex → parse → lower → resolve
-//! → Salsa incremental diagnostics.
+//! Tests exercise the complete pipeline: source → lex_file → parse → lower
+//! → resolve → Salsa incremental diagnostics.
 
 use lw_ast::{Expr, Stmt};
 use lw_cst::CstNode;
@@ -15,7 +15,6 @@ use lw_demo::{
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Collect diagnostic messages from the Salsa DB for a file.
 fn diag_messages(db: &Database, path: &str) -> Vec<String> {
     let file = db.get_file(path).expect("file not found in DB");
     file_diagnostics(db, file)
@@ -33,7 +32,6 @@ fn single_file_parse_and_lower() {
     let source = "let x = 1 + 2";
     let result = parse(source);
 
-    // Zero parse errors.
     assert!(
         result.errors.is_empty(),
         "unexpected parse errors: {:?}",
@@ -41,7 +39,7 @@ fn single_file_parse_and_lower() {
     );
 
     // CST: Root > LetBinding
-    let root = result.arena.get(result.root);
+    let root = result.tree.get(result.root);
     let CstNode::Root { children } = root else {
         panic!("expected Root, got {:?}", root);
     };
@@ -49,26 +47,25 @@ fn single_file_parse_and_lower() {
         .iter()
         .filter(|&&id| {
             !matches!(
-                result.arena.get(id),
+                result.tree.get(id),
                 CstNode::Whitespace { .. } | CstNode::Comment { .. }
             )
         })
         .collect();
     assert_eq!(non_trivia.len(), 1, "expected one LetBinding child");
 
-    // CST: LetBinding > BinaryExpr
-    let binding = result.arena.get(*non_trivia[0]);
+    let binding = result.tree.get(*non_trivia[0]);
     let CstNode::LetBinding { value, .. } = binding else {
         panic!("expected LetBinding, got {:?}", binding);
     };
     assert!(
-        matches!(result.arena.get(*value), CstNode::BinaryExpr { .. }),
+        matches!(result.tree.get(*value), CstNode::BinaryExpr { .. }),
         "expected BinaryExpr, got {:?}",
-        result.arena.get(*value)
+        result.tree.get(*value)
     );
 
     // AST: typed Expr children
-    let lr = lower(&result.arena, result.root, source);
+    let lr = lower(&result.arena, &result.tree, result.root);
     assert!(lr.errors.is_empty());
     assert_eq!(lr.ast.top_level.len(), 1);
     let stmt = lr.ast.stmt(lr.ast.top_level[0]);
@@ -127,7 +124,7 @@ fn import_found_cross_file() {
     // (imported `pi` is defined in `math.lw`, not in main's AST).
     let source = "import \"math.lw\"\nlet area = pi * 10 * 10";
     let pr = parse(source);
-    let lr = lower(&pr.arena, pr.root, source);
+    let lr = lower(&pr.arena, &pr.tree, pr.root);
     let binding_names: Vec<&str> = lr
         .ast
         .top_level
@@ -156,14 +153,12 @@ fn salsa_incremental_invalidation() {
     db.set_file("math.lw", "let pi = 3");
     db.set_file("main.lw", "import \"math.lw\"\nlet area = pi * 10 * 10");
 
-    // Step 1: initial state — zero diagnostics.
     let msgs = diag_messages(&db, "main.lw");
     assert!(
         msgs.is_empty(),
         "step 1: expected zero diagnostics, got: {msgs:?}"
     );
 
-    // Step 2: remove pi from math.lw — unknown identifier should appear.
     db.set_file("math.lw", "");
     let msgs = diag_messages(&db, "main.lw");
     assert!(
@@ -172,7 +167,6 @@ fn salsa_incremental_invalidation() {
         "step 2: expected 'unknown identifier: pi', got: {msgs:?}"
     );
 
-    // Step 3: restore math.lw — zero diagnostics again.
     db.set_file("math.lw", "let pi = 3");
     let msgs = diag_messages(&db, "main.lw");
     assert!(
@@ -199,22 +193,20 @@ fn duplicate_binding() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: Typed AST structure — BinaryExpr has Expr children, not IDs
+// Test 6: Typed AST structure — BinaryExpr has Expr children
 // ---------------------------------------------------------------------------
 
 #[test]
 fn ast_binary_expr_has_typed_expr_children() {
     let source = "let z = 10 + 20 * 30";
     let pr = parse(source);
-    let lr = lower(&pr.arena, pr.root, source);
+    let lr = lower(&pr.arena, &pr.tree, pr.root);
     assert!(lr.errors.is_empty());
 
     let Stmt::Let { value, .. } = lr.ast.stmt(lr.ast.top_level[0]) else {
         panic!("expected Let");
     };
 
-    // The outer expression is a BinaryExpr.  Its children are ExprId values
-    // that can ONLY point at Expr nodes — this is enforced at the type level.
     fn walk_expr(ast: &lw_ast::Ast, id: lw_ast::ExprId) -> usize {
         match ast.expr(id) {
             Expr::Binary { lhs, rhs, .. } => 1 + walk_expr(ast, *lhs) + walk_expr(ast, *rhs),
@@ -223,7 +215,6 @@ fn ast_binary_expr_has_typed_expr_children() {
         }
     }
 
-    // Should have at least 5 nodes: (10 + (20 * 30)) or ((10 + 20) * 30)
     let count = walk_expr(&lr.ast, *value);
     assert!(
         count >= 5,
@@ -232,7 +223,7 @@ fn ast_binary_expr_has_typed_expr_children() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: Integer overflow produces diagnostic, not silent 0
+// Test 7: Integer overflow produces diagnostic
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -259,7 +250,7 @@ fn empty_file_no_diagnostics() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9: Comments are preserved in CST but stripped from AST
+// Test 9: Comments preserved in CST, stripped from AST
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -268,17 +259,48 @@ fn comments_preserved_in_cst_stripped_from_ast() {
     let pr = parse(source);
     assert!(pr.errors.is_empty());
 
-    // CST should have a Comment node.
-    let CstNode::Root { children } = pr.arena.get(pr.root) else {
+    let CstNode::Root { children } = pr.tree.get(pr.root) else {
         panic!("expected Root");
     };
     let has_comment = children
         .iter()
-        .any(|&id| matches!(pr.arena.get(id), CstNode::Comment { .. }));
+        .any(|&id| matches!(pr.tree.get(id), CstNode::Comment { .. }));
     assert!(has_comment, "CST should contain a Comment node");
 
-    // AST should NOT contain comments — they're stripped during lowering.
-    let lr = lower(&pr.arena, pr.root, source);
+    let lr = lower(&pr.arena, &pr.tree, pr.root);
     assert_eq!(lr.ast.top_level.len(), 1);
     assert!(matches!(lr.ast.stmt(lr.ast.top_level[0]), Stmt::Let { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Line index integration — positions are computed on demand
+// ---------------------------------------------------------------------------
+
+#[test]
+fn line_index_computes_positions_on_demand() {
+    let source = "let x = 1\nlet y = 2";
+    let pr = parse(source);
+    assert!(pr.errors.is_empty());
+
+    // The line index should report 2 lines.
+    assert_eq!(pr.line_index.line_count(), 2);
+
+    // byte offset 10 = start of "let y = 2" → line 1, col 0
+    let pos = pr.line_index.byte_to_lsp_position(10);
+    assert_eq!(pos.line, 1);
+    assert_eq!(pos.character, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: CstArena token text extraction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cst_arena_extracts_token_text() {
+    let source = "let pi = 3";
+    let pr = parse(source);
+
+    // Tokens: let(0) ws(1) pi(2) ws(3) =(4) ws(5) 3(6)
+    assert_eq!(pr.arena.token_text(2), "pi");
+    assert_eq!(pr.arena.token_text(6), "3");
 }

@@ -1,7 +1,7 @@
 # lw-demo
 
-End-to-end language pipeline for a tiny expression language, demonstrating how
-the lang-workbench crates compose into a real compiler.
+End-to-end Data-Oriented language pipeline for a tiny expression language,
+demonstrating how the lang-workbench crates compose into a real compiler.
 
 ## The Language
 
@@ -33,152 +33,153 @@ let area = pi * 10 * 10
 source text
     │
     ▼
-┌─────────┐   logos 0.16 DFA          Token stream
-│  lexer   │──────────────────────►  Vec<Token>
-└─────────┘
+┌──────────┐   logos 0.16 DFA          (CstArena, LineIndex)
+│ lex_file  │──────────────────────►  flat token array + newline table
+└──────────┘
     │
     ▼
-┌─────────┐   recursive descent       Lossless concrete syntax tree
-│  parser  │──────────────────────►  CstArena + CstNodeId
-└─────────┘                           (la-arena, preserves trivia)
+┌──────────┐   recursive descent       CstTree (flat Vec<CstNode>)
+│  parser   │──────────────────────►  nodes reference tokens via TokenSpan
+└──────────┘
     │
     ▼
-┌─────────┐   typed lowering           Typed abstract syntax tree
-│  lower   │──────────────────────►  Ast { exprs: Arena<Expr>, stmts: Arena<Stmt> }
-└─────────┘                           (la-arena, no trivia)
+┌──────────┐   typed lowering           Ast { exprs: Vec<Expr>, stmts: Vec<Stmt> }
+│  lower    │──────────────────────►  typed ExprId/StmtId indices
+└──────────┘
     │
     ▼
-┌──────────┐  cross-file resolution    Diagnostics
-│ resolver  │──────────────────────►  Vec<Diagnostic>
-└──────────┘  (VFS-backed)
+┌──────────┐   cross-file resolution    Vec<Diagnostic>
+│ resolver  │──────────────────────►  span = TokenSpan (no line/col)
+└──────────┘
     │
     ▼
-┌──────────┐  incremental              Cached diagnostics
+┌──────────┐   incremental              Cached diagnostics
 │ salsa_db  │──────────────────────►  file_diagnostics(file) → Vec<Diagnostic>
-└──────────┘  (tracks cross-file deps)
+└──────────┘
 ```
 
 ---
 
 ## Design Decisions
 
-### Why typed arena indices instead of flat `u32` IDs?
+### Rule 1: No Pointers
 
-The previous design used a flat columnar layout:
+No `Box`, `Rc`, `RefCell`, or lifetimes are used to represent syntax trees.
+All inter-node references are integer indices (`u32`) into flat arrays.
+
+**Why?** Pointer-based trees have poor cache locality (nodes scattered across
+the heap), can't be trivially serialized/deserialized, and lifetime parameters
+infect all code that touches the tree. Integer indices into contiguous arrays
+are cache-friendly, `Copy`, and trivially `Send`/`Sync`.
+
+### Rule 2: Flat Arrays Only
+
+All syntax data is stored in flat, contiguous `Vec`s:
+
+- `CstArena.tokens: Vec<SyntaxToken>` — the token ledger
+- `CstTree.nodes: Vec<CstNode>` — the tree node array
+- `Ast.exprs: Vec<Expr>` — expression arena
+- `Ast.stmts: Vec<Stmt>` — statement arena
+- `Ast.expr_spans: Vec<TokenSpan>` — parallel span array
+
+Each `Vec` is a single contiguous allocation. Indices into these arrays are
+plain `u32` values (wrapped in newtypes for type safety).
+
+### Rule 3: No Line Numbers in Nodes
+
+No token or AST node stores line or column numbers. Instead:
+
+- `SyntaxToken` stores only `kind: u16` and `len: u32` (byte length)
+- `TokenSpan` stores `start_idx: u32` and `len: u16` (token index + count)
+- `LineIndex` stores `newlines: Vec<u32>` (byte offsets of `\n` characters)
+
+Line/column positions are computed **on demand** via
+`LineIndex::byte_to_lsp_position(byte_offset)`, which uses binary search
+(`partition_point`) for O(log n) lookup.
+
+**Why?** Storing line numbers per-token wastes space and creates maintenance
+burden (they must be recomputed on every edit). The line index is built once
+during lexing and shared by all downstream passes.
+
+### The Packed Token Span (`TokenSpan`)
 
 ```rust
-// OLD: untyped u32 indices — any ID can point at anything
-pub type AstNodeId = u32;
-pub enum AstNodeKind {
-    BinaryExpr { op: BinOp, lhs: AstNodeId, rhs: AstNodeId },
-    LetBinding { name: String, value: AstNodeId },
-    Import { path: String },
-    // ...
+pub struct TokenSpan {
+    pub start_idx: u32,  // index into the token array
+    pub len: u16,        // number of tokens this span covers
 }
 ```
 
-This has three problems:
+**6 bytes** total. Covers up to 65,535 tokens per syntactic construct, which
+is more than sufficient. Token spans can be resolved to byte ranges via
+`CstArena::span_byte_range(&self, span: &TokenSpan) -> (u32, u32)`.
 
-1. **No type safety.** `BinaryExpr { lhs: AstNodeId }` could point at a `Root`
-   or an `Import` node — nothing prevents it at the type level.
-
-2. **Error-prone lowering.** Because parent nodes need to reference children
-   that haven't been allocated yet, the lowerer must use a
-   "placeholder-then-patch" pattern: allocate with `lhs: 0`, then mutate.
-   If lowering the child fails, the fallback `unwrap_or(parent_id)` creates
-   **self-referential cycles** that break later traversals.
-
-3. **Harder to extend.** Adding a new node category (types, patterns, etc.)
-   pollutes a single `AstNodeKind` enum.
-
-The new design uses **typed arenas** (the approach used by rust-analyzer):
+### The CST Arena (The Flat Ledger)
 
 ```rust
-// NEW: typed indices — only Expr can appear where ExprId is expected
-pub type ExprId = Idx<Expr>;
-pub type StmtId = Idx<Stmt>;
+pub struct SyntaxToken {
+    pub kind: u16,  // language-specific token kind
+    pub len: u32,   // byte length of this token's text
+}
+
+pub struct CstArena {
+    text: String,               // complete source text
+    tokens: Vec<SyntaxToken>,   // flat token array
+    byte_starts: Vec<u32>,      // precomputed cumulative byte offsets
+}
+```
+
+Token text is derived on demand: `arena.token_text(idx)` extracts the
+substring from `text` using the cumulative byte offset table. No token
+stores its own text.
+
+### The Line Index (For LSP Communication)
+
+```rust
+pub struct LineIndex {
+    newlines: Vec<u32>,  // byte offset of each '\n'
+}
+```
+
+`byte_to_lsp_position` uses `partition_point` (binary search) to find the
+line, then computes the column as `byte_offset - line_start`.
+
+### Typed AST Indices
+
+```rust
+pub struct ExprId(pub u32);  // index into Ast.exprs
+pub struct StmtId(pub u32);  // index into Ast.stmts
 
 pub enum Expr {
     Binary { op: BinOp, lhs: ExprId, rhs: ExprId },
     IntLiteral(i64),
     Identifier(String),
-    Missing,  // error recovery — no cycles possible
-}
-
-pub enum Stmt {
-    Let { name: String, value: ExprId },
-    Import { path: String },
-    Error,
+    Missing,
 }
 ```
 
-Benefits:
-- **Type-level correctness:** `BinaryExpr { lhs: ExprId }` can only reference
-  expressions. The compiler rejects `StmtId` there.
-- **No placeholder pattern:** Children are lowered first, then the parent is
-  allocated with the real IDs. `Expr::Missing` handles failures without cycles.
-- **Composable:** New node categories get their own arena + ID type.
-- **Cache-friendly:** Each `Arena<T>` is a contiguous `Vec<T>` internally.
+**Why newtypes instead of plain `u32`?** The compiler enforces that
+`Binary { lhs: ExprId }` can only reference expressions, not statements.
+A plain `u32` would allow silently mixing indices from different arrays.
 
-### Why la-arena?
+**Why `Expr::Missing` instead of `Option<ExprId>`?** `Missing` is a concrete
+node — it has an `ExprId` and can appear anywhere an expression is expected.
+This means `Binary { lhs, rhs }` always has valid children (no `Option`
+unwrapping), and analyses can pattern-match on `Missing` to report errors.
 
-[`la-arena`](https://crates.io/crates/la-arena) (from rust-analyzer) provides:
-- `Arena<T>`: a typed arena backed by `Vec<T>` — O(1) alloc, O(1) index
-- `Idx<T>`: a typed index that is `Copy`, `Eq`, `Hash`, `Ord` — perfect for
-  inter-node references
-- `ArenaMap<Idx<T>, V>`: a sparse map from arena indices to values — used
-  here for source spans
-- WASM-safe: no OS threads, no custom allocators
+### Span storage: parallel arrays
 
-Compared to `bumpalo` (the previous choice):
-- `bumpalo` returns `&'bump T` references → lifetime hell when nodes
-  cross-reference each other, and a poor fit for Salsa's query model
-- `la-arena` returns `Idx<T>` handles → no lifetimes, `Copy`, serializable
-
-### Why separate expression and statement types?
-
-In a real compiler, expressions and statements have fundamentally different
-semantics:
-- Expressions produce values and compose recursively
-- Statements have side effects (binding, importing) and execute in order
-
-Mixing them in a single enum means every match arm must handle irrelevant
-variants. Separate types make each handler focused and exhaustive.
-
-### Why `Expr::Missing` instead of `Option<ExprId>`?
-
-`Expr::Missing` is a concrete node in the arena — it has an `ExprId` and can
-appear anywhere an expression is expected. This means:
-- `BinaryExpr { lhs, rhs }` always has valid child IDs (no `Option` unwrapping)
-- Analyses can pattern-match on `Missing` to report errors
-- No risk of `None`-induced panics in later passes
-
-This is the approach used by rust-analyzer's `hir_def::body::Body`.
-
-### Why are spans stored in `ArenaMap` rather than inline?
-
-Storing spans separately from node data keeps the `Expr` and `Stmt` enums
-small and cache-friendly for passes that don't need location info (e.g. type
-checking, evaluation). Passes that do need spans (diagnostics, hover) pay for
-the lookup only when needed.
+Source spans are stored in separate `Vec<TokenSpan>` arrays parallel to the
+node arrays (`expr_spans[i]` corresponds to `exprs[i]`). This keeps the
+core `Expr`/`Stmt` enums small and cache-friendly for passes that don't need
+location info (e.g. type checking, evaluation).
 
 ### CST trivia handling — known limitation
 
 The CST is lossless at the **top level**: whitespace and comments between
-statements are preserved as `CstNode::Whitespace` / `CstNode::Comment` nodes
-in the root's `children` list.
-
-However, trivia **inside** compound nodes (e.g. whitespace between `let` and
-the binding name, or between operands in a binary expression) is currently
-consumed by the parser without creating CST nodes. This means the CST is not
-fully round-trippable for formatting purposes.
-
-Fixing this requires either:
-- A **red-green tree** (like Roslyn/rust-analyzer) where every node has a flat
-  `children: Vec<Element>` containing both tokens and sub-nodes
-- Explicit **leading/trailing trivia** attached to each token
-
-This is a planned improvement.
+statements are preserved as CST nodes. However, trivia inside compound nodes
+(e.g. whitespace between `let` and the binding name) is consumed without
+creating CST nodes. Full inner-trivia tracking requires a red-green tree.
 
 ---
 
@@ -188,20 +189,19 @@ Tests are organized in three tiers:
 
 ### Unit tests (in-module)
 
-Each module has `#[cfg(test)] mod tests` with focused tests:
+- **`lw-cst`** — 7 tests: TokenSpan, CstArena text extraction, LineIndex
+- **`lexer.rs`** — 8 tests: token sequences, CRLF, lossless coverage, errors, LineIndex
+- **`parser.rs`** — 6 tests: CST shape, error recovery, trivia, multi-statement
+- **`lower.rs`** — 4 tests: typed children, integer overflow, imports
 
-- **`lexer.rs`** — token sequences, CRLF handling, lossless coverage, error tokens
-- **`parser.rs`** — CST shape, error recovery, trivia preservation, multi-statement
-- **`lower.rs`** — typed children, integer overflow, import lowering
-
-Run with:
 ```sh
+cargo test -p lw-cst --lib
 cargo test -p lw-demo --lib
 ```
 
 ### Integration tests (`tests/pipeline.rs`)
 
-End-to-end tests exercising the full pipeline:
+11 end-to-end tests:
 
 1. Single file parse + lower + zero diagnostics
 2. Import not found
@@ -212,13 +212,14 @@ End-to-end tests exercising the full pipeline:
 7. Integer overflow diagnostic
 8. Empty file
 9. Comment preservation in CST / stripping in AST
+10. Line index on-demand position computation
+11. CstArena token text extraction
 
-Run with:
 ```sh
 cargo test -p lw-demo --test pipeline
 ```
 
 ### Full suite
 ```sh
-cargo test -p lw-demo
+cargo test -p lw-cst -p lw-ast -p lw-demo
 ```

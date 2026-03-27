@@ -1,24 +1,34 @@
 //! Recursive-descent parser for the `lw-demo` language.
 //!
-//! Produces a lossless [`CstArena`]: whitespace, comments, and errors are all
-//! represented as nodes so the tree is a complete, round-trippable copy of the
-//! source.
+//! Produces a lossless [`CstTree`] on top of the flat [`CstArena`] token
+//! ledger: whitespace, comments, and errors are all represented as nodes so
+//! the tree is a complete, round-trippable copy of the source.
+//!
+//! # Trivia handling
+//!
+//! Trivia (whitespace, comments) between top-level statements is preserved
+//! as `CstNode::Whitespace` / `CstNode::Comment` nodes in the root's
+//! children list.  Trivia inside compound nodes (e.g. between `let` and the
+//! binding name) is consumed but not currently tracked — this is a known
+//! limitation.  Full inner-trivia tracking requires a red-green tree.
 
-use lw_cst::{BinOp, CstArena, CstNode, CstNodeId, LiteralKind, TextRange};
+use lw_cst::{BinOp, CstArena, CstNode, CstNodeId, CstTree, LiteralKind, TokenSpan};
 
-use crate::lexer::{Token, TokenKind, lex};
+use crate::lexer::{TokenKind, lex_file};
 
-/// A parse error with its source location.
+/// A parse error with its source location (as a token span).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
-    pub range: TextRange,
+    pub span: TokenSpan,
     pub message: String,
 }
 
 /// The output of a single-file parse.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ParseResult {
     pub arena: CstArena,
+    pub line_index: lw_cst::LineIndex,
+    pub tree: CstTree,
     pub root: CstNodeId,
     pub errors: Vec<ParseError>,
 }
@@ -27,66 +37,63 @@ pub struct ParseResult {
 // Parser state
 // ---------------------------------------------------------------------------
 
-struct Parser<'src> {
-    tokens: Vec<Token>,
-    pos: usize,
+struct Parser {
     arena: CstArena,
+    line_index: lw_cst::LineIndex,
+    tree: CstTree,
     errors: Vec<ParseError>,
-    #[allow(dead_code)]
-    source: &'src str,
+    pos: u32,
 }
 
-impl<'src> Parser<'src> {
-    fn new(source: &'src str) -> Self {
-        let tokens = lex(source);
+impl Parser {
+    fn new(source: &str) -> Self {
+        let (arena, line_index) = lex_file(source);
         Self {
-            source,
-            tokens,
-            pos: 0,
-            arena: CstArena::new(),
+            arena,
+            line_index,
+            tree: CstTree::new(),
             errors: Vec::new(),
+            pos: 0,
         }
     }
 
     // --- token access helpers ---
 
-    fn current(&self) -> &Token {
-        &self.tokens[self.pos]
+    fn current_kind(&self) -> TokenKind {
+        if self.pos < self.arena.token_count() {
+            TokenKind::from_u16(self.arena.token(self.pos).kind)
+        } else {
+            TokenKind::Eof
+        }
     }
 
-    fn current_kind(&self) -> &TokenKind {
-        &self.current().kind
-    }
-
-    fn advance(&mut self) -> Token {
-        let tok = self.tokens[self.pos].clone();
-        if self.pos + 1 < self.tokens.len() {
+    fn advance(&mut self) -> u32 {
+        let idx = self.pos;
+        if self.pos + 1 < self.arena.token_count() {
             self.pos += 1;
         }
-        tok
+        idx
     }
 
     /// Consume trivia (whitespace, newlines, comments) and emit them as CST
-    /// nodes that are appended to `children`.
+    /// nodes appended to `children`.
     fn eat_trivia(&mut self, children: &mut Vec<CstNodeId>) {
         loop {
             match self.current_kind() {
-                TokenKind::Whitespace => {
-                    let range = self.current().range.clone();
+                TokenKind::Whitespace | TokenKind::Newline => {
+                    let idx = self.pos;
                     self.advance();
-                    let id = self.arena.alloc(CstNode::Whitespace { range });
-                    children.push(id);
-                }
-                TokenKind::Newline => {
-                    let range = self.current().range.clone();
-                    self.advance();
-                    let id = self.arena.alloc(CstNode::Whitespace { range });
+                    let id = self.tree.alloc(CstNode::Whitespace {
+                        span: TokenSpan::single(idx),
+                    });
                     children.push(id);
                 }
                 TokenKind::Comment => {
-                    let range = self.current().range.clone();
+                    let idx = self.pos;
                     self.advance();
-                    let id = self.arena.alloc(CstNode::Comment { range });
+                    let id = self.tree.alloc(CstNode::Comment {
+                        span: TokenSpan::single(idx),
+                    });
                     children.push(id);
                 }
                 _ => break,
@@ -99,37 +106,32 @@ impl<'src> Parser<'src> {
     // All binary operators currently have the same precedence and associate
     // left-to-right.  Precedence levels (e.g. `*`/`/` > `+`/`-`) can be
     // added later via precedence climbing or a Pratt parser.
-    //
-    // Note: trivia (whitespace, comments) between operands and operators is
-    // consumed but not emitted as CST nodes inside expressions.  The CST is
-    // lossless at the *top level* (between statements), but trivia inside
-    // compound nodes like LetBinding and BinaryExpr is currently not tracked.
-    // This is a known limitation — full inner-trivia tracking requires either
-    // a red-green tree or an explicit children list per node.
 
     fn parse_primary(&mut self) -> Option<CstNodeId> {
-        match self.current_kind().clone() {
+        match self.current_kind() {
             TokenKind::IntLiteral => {
-                let range = self.current().range.clone();
+                let idx = self.pos;
                 self.advance();
-                Some(self.arena.alloc(CstNode::Literal {
+                Some(self.tree.alloc(CstNode::Literal {
                     kind: LiteralKind::Integer,
-                    range,
+                    span: TokenSpan::single(idx),
                 }))
             }
             TokenKind::Ident => {
-                let range = self.current().range.clone();
+                let idx = self.pos;
                 self.advance();
-                Some(self.arena.alloc(CstNode::Identifier { range }))
+                Some(self.tree.alloc(CstNode::Identifier {
+                    span: TokenSpan::single(idx),
+                }))
             }
             _ => {
-                let range = self.current().range.clone();
+                let span = TokenSpan::single(self.pos);
                 self.errors.push(ParseError {
-                    range: range.clone(),
+                    span,
                     message: format!("expected expression, found {:?}", self.current_kind()),
                 });
-                let id = self.arena.alloc(CstNode::Error {
-                    range,
+                let id = self.tree.alloc(CstNode::Error {
+                    span,
                     message: "expected expression".to_string(),
                 });
                 None.or(Some(id))
@@ -137,13 +139,13 @@ impl<'src> Parser<'src> {
         }
     }
 
-    /// Parse a binary expression with left-to-right associativity.
     fn parse_expr(&mut self) -> CstNodeId {
+        let start_pos = self.pos;
         let mut lhs = match self.parse_primary() {
             Some(id) => id,
             None => {
-                return self.arena.alloc(CstNode::Error {
-                    range: self.current().range.clone(),
+                return self.tree.alloc(CstNode::Error {
+                    span: TokenSpan::single(self.pos),
                     message: "expected expression".to_string(),
                 });
             }
@@ -151,15 +153,15 @@ impl<'src> Parser<'src> {
 
         loop {
             // Skip whitespace between tokens in an expression.
-            let mut lookahead_pos = self.pos;
+            let mut lookahead = self.pos;
             while matches!(
-                self.tokens[lookahead_pos].kind,
+                TokenKind::from_u16(self.arena.token(lookahead).kind),
                 TokenKind::Whitespace | TokenKind::Comment
             ) {
-                lookahead_pos += 1;
+                lookahead += 1;
             }
 
-            let op = match &self.tokens[lookahead_pos].kind {
+            let op = match TokenKind::from_u16(self.arena.token(lookahead).kind) {
                 TokenKind::Plus => BinOp::Add,
                 TokenKind::Minus => BinOp::Sub,
                 TokenKind::Star => BinOp::Mul,
@@ -167,35 +169,30 @@ impl<'src> Parser<'src> {
                 _ => break,
             };
 
-            // Consume any trivia before the operator (but don't attach them as
-            // separate children here — they sit inside the BinaryExpr).
-            while self.pos < lookahead_pos {
+            // Consume trivia + operator.
+            while self.pos <= lookahead {
                 self.advance();
             }
-            // Consume the operator itself.
-            self.advance();
 
             // Skip whitespace after the operator.
-            while matches!(
-                self.current_kind(),
-                TokenKind::Whitespace | TokenKind::Comment
-            ) {
+            while self.current_kind().is_trivia() {
                 self.advance();
             }
 
             let rhs = self.parse_primary().unwrap_or_else(|| {
-                let range = self.current().range.clone();
+                let span = TokenSpan::single(self.pos);
                 self.errors.push(ParseError {
-                    range: range.clone(),
+                    span,
                     message: "expected right-hand side of expression".to_string(),
                 });
-                self.arena.alloc(CstNode::Error {
-                    range,
+                self.tree.alloc(CstNode::Error {
+                    span,
                     message: "expected rhs".to_string(),
                 })
             });
 
-            lhs = self.arena.alloc(CstNode::BinaryExpr { op, lhs, rhs });
+            let _ = start_pos; // suppress unused warning
+            lhs = self.tree.alloc(CstNode::BinaryExpr { op, lhs, rhs });
         }
 
         lhs
@@ -203,89 +200,73 @@ impl<'src> Parser<'src> {
 
     // --- statement parsing ---
 
-    /// Parse a `let <name> = <expr>` statement. The `let` token has already
-    /// been consumed by the caller.
-    fn parse_let(&mut self, _let_range: TextRange) -> CstNodeId {
+    fn parse_let(&mut self) -> CstNodeId {
         // Skip whitespace after `let`.
-        while matches!(
-            self.current_kind(),
-            TokenKind::Whitespace | TokenKind::Comment
-        ) {
+        while self.current_kind().is_trivia() {
             self.advance();
         }
 
-        // name
-        let name_range = if self.current_kind() == &TokenKind::Ident {
-            let r = self.current().range.clone();
+        // Name
+        let name_span = if self.current_kind() == TokenKind::Ident {
+            let span = TokenSpan::single(self.pos);
             self.advance();
-            r
+            span
         } else {
-            let range = self.current().range.clone();
+            let span = TokenSpan::single(self.pos);
             self.errors.push(ParseError {
-                range: range.clone(),
+                span,
                 message: "expected identifier after `let`".to_string(),
             });
-            range
+            span
         };
 
         // Skip whitespace before `=`.
-        while matches!(
-            self.current_kind(),
-            TokenKind::Whitespace | TokenKind::Comment
-        ) {
+        while self.current_kind().is_trivia() {
             self.advance();
         }
 
         // `=`
-        if self.current_kind() == &TokenKind::Equals {
+        if self.current_kind() == TokenKind::Equals {
             self.advance();
         } else {
-            let range = self.current().range.clone();
+            let span = TokenSpan::single(self.pos);
             self.errors.push(ParseError {
-                range: range.clone(),
+                span,
                 message: "expected `=` after binding name".to_string(),
             });
         }
 
-        // Skip whitespace before the value expression.
-        while matches!(
-            self.current_kind(),
-            TokenKind::Whitespace | TokenKind::Comment
-        ) {
+        // Skip whitespace before value.
+        while self.current_kind().is_trivia() {
             self.advance();
         }
 
         let value = self.parse_expr();
 
-        self.arena.alloc(CstNode::LetBinding {
-            name: name_range,
+        self.tree.alloc(CstNode::LetBinding {
+            name: name_span,
             value,
         })
     }
 
-    /// Parse an `import "<path>"` statement. The `import` token has already
-    /// been consumed by the caller.
-    fn parse_import(&mut self, _import_range: TextRange) -> CstNodeId {
+    fn parse_import(&mut self) -> CstNodeId {
         // Skip whitespace after `import`.
-        while matches!(
-            self.current_kind(),
-            TokenKind::Whitespace | TokenKind::Comment
-        ) {
+        while self.current_kind().is_trivia() {
             self.advance();
         }
 
-        if self.current_kind() == &TokenKind::StringLiteral {
-            let path_range = self.current().range.clone();
+        if self.current_kind() == TokenKind::StringLiteral {
+            let span = TokenSpan::single(self.pos);
             self.advance();
-            self.arena.alloc(CstNode::Import { path: path_range })
+            self.tree.alloc(CstNode::Import { path: span })
         } else {
-            let range = self.current().range.clone();
+            let span = TokenSpan::single(self.pos);
             self.errors.push(ParseError {
-                range: range.clone(),
+                span,
                 message: "expected string literal after `import`".to_string(),
             });
-            self.arena.alloc(CstNode::Error {
-                range,
+            self.tree.alloc(CstNode::Error {
+                span,
                 message: "expected import path".to_string(),
             })
         }
@@ -299,31 +280,29 @@ impl<'src> Parser<'src> {
         loop {
             self.eat_trivia(&mut children);
 
-            match self.current_kind().clone() {
+            match self.current_kind() {
                 TokenKind::Eof => break,
                 TokenKind::Let => {
-                    let let_range = self.current().range.clone();
                     self.advance();
-                    let node = self.parse_let(let_range);
+                    let node = self.parse_let();
                     children.push(node);
                 }
                 TokenKind::Import => {
-                    let import_range = self.current().range.clone();
                     self.advance();
-                    let node = self.parse_import(import_range);
+                    let node = self.parse_import();
                     children.push(node);
                 }
                 _ => {
-                    let range = self.current().range.clone();
+                    let span = TokenSpan::single(self.pos);
                     self.errors.push(ParseError {
-                        range: range.clone(),
+                        span,
                         message: format!(
                             "unexpected token at top level: {:?}",
                             self.current_kind()
                         ),
                     });
-                    let id = self.arena.alloc(CstNode::Error {
-                        range,
+                    let id = self.tree.alloc(CstNode::Error {
+                        span,
                         message: "unexpected token".to_string(),
                     });
                     children.push(id);
@@ -332,7 +311,7 @@ impl<'src> Parser<'src> {
             }
         }
 
-        self.arena.alloc(CstNode::Root { children })
+        self.tree.alloc(CstNode::Root { children })
     }
 }
 
@@ -346,6 +325,8 @@ pub fn parse(source: &str) -> ParseResult {
     let root = p.parse_root();
     ParseResult {
         arena: p.arena,
+        line_index: p.line_index,
+        tree: p.tree,
         root,
         errors: p.errors,
     }
@@ -364,7 +345,7 @@ mod tests {
         let result = parse("let x = 1");
         assert!(result.errors.is_empty(), "{:?}", result.errors);
 
-        let root = result.arena.get(result.root);
+        let root = result.tree.get(result.root);
         let CstNode::Root { children } = root else {
             panic!("expected Root");
         };
@@ -372,14 +353,14 @@ mod tests {
             .iter()
             .filter(|&&id| {
                 !matches!(
-                    result.arena.get(id),
+                    result.tree.get(id),
                     CstNode::Whitespace { .. } | CstNode::Comment { .. }
                 )
             })
             .collect();
         assert_eq!(non_trivia.len(), 1);
         assert!(matches!(
-            result.arena.get(*non_trivia[0]),
+            result.tree.get(*non_trivia[0]),
             CstNode::LetBinding { .. }
         ));
     }
@@ -395,7 +376,7 @@ mod tests {
         let result = parse("import \"std.lw\"");
         assert!(result.errors.is_empty(), "{:?}", result.errors);
 
-        let root = result.arena.get(result.root);
+        let root = result.tree.get(result.root);
         let CstNode::Root { children } = root else {
             panic!("expected Root");
         };
@@ -403,14 +384,14 @@ mod tests {
             .iter()
             .filter(|&&id| {
                 !matches!(
-                    result.arena.get(id),
+                    result.tree.get(id),
                     CstNode::Whitespace { .. } | CstNode::Comment { .. }
                 )
             })
             .collect();
         assert_eq!(non_trivia.len(), 1);
         assert!(matches!(
-            result.arena.get(*non_trivia[0]),
+            result.tree.get(*non_trivia[0]),
             CstNode::Import { .. }
         ));
     }
@@ -418,20 +399,18 @@ mod tests {
     #[test]
     fn parse_error_recovery_at_top_level() {
         let result = parse("@ let x = 1");
-        // Should recover and still parse the let binding.
         assert!(!result.errors.is_empty());
 
-        let root = result.arena.get(result.root);
+        let root = result.tree.get(result.root);
         let CstNode::Root { children } = root else {
             panic!("expected Root");
         };
-        // Should have at least an Error node and a LetBinding.
         let has_error = children
             .iter()
-            .any(|&id| matches!(result.arena.get(id), CstNode::Error { .. }));
+            .any(|&id| matches!(result.tree.get(id), CstNode::Error { .. }));
         let has_let = children
             .iter()
-            .any(|&id| matches!(result.arena.get(id), CstNode::LetBinding { .. }));
+            .any(|&id| matches!(result.tree.get(id), CstNode::LetBinding { .. }));
         assert!(has_error, "expected an error node");
         assert!(has_let, "expected a let binding after recovery");
     }
@@ -441,7 +420,7 @@ mod tests {
         let result = parse("let x = 1\n\nlet y = 2");
         assert!(result.errors.is_empty());
 
-        let root = result.arena.get(result.root);
+        let root = result.tree.get(result.root);
         let CstNode::Root { children } = root else {
             panic!("expected Root");
         };
@@ -449,7 +428,7 @@ mod tests {
             .iter()
             .filter(|&&id| {
                 matches!(
-                    result.arena.get(id),
+                    result.tree.get(id),
                     CstNode::Whitespace { .. } | CstNode::Comment { .. }
                 )
             })
@@ -462,7 +441,7 @@ mod tests {
         let result = parse("let a = 1\nlet b = 2\nlet c = 3");
         assert!(result.errors.is_empty());
 
-        let root = result.arena.get(result.root);
+        let root = result.tree.get(result.root);
         let CstNode::Root { children } = root else {
             panic!("expected Root");
         };
@@ -470,7 +449,7 @@ mod tests {
             .iter()
             .filter(|&&id| {
                 matches!(
-                    result.arena.get(id),
+                    result.tree.get(id),
                     CstNode::LetBinding { .. } | CstNode::Import { .. }
                 )
             })

@@ -1,54 +1,44 @@
-//! `lw-ast` — Abstract Syntax Tree for lang-workbench.
+//! `lw-ast` — Data-Oriented Abstract Syntax Tree for lang-workbench.
 //!
-//! # Design: Typed Arenas
+//! # Design: Flat Typed Arrays
 //!
-//! The AST uses **typed arena indices** rather than a flat untyped ID space.
-//! Each node category (expressions, statements) lives in its own
-//! [`la_arena::Arena`], and references between nodes carry their type in the
-//! index type itself:
+//! The AST uses **typed newtype indices** over flat `Vec`s — no `Box`, `Rc`,
+//! `RefCell`, or lifetimes.  Each node category (expressions, statements)
+//! lives in its own `Vec`, and references between nodes carry their type in
+//! the index wrapper:
 //!
-//! - [`ExprId`] (`Idx<Expr>`) — can only point at an [`Expr`]
-//! - [`StmtId`] (`Idx<Stmt>`) — can only point at a [`Stmt`]
+//! - [`ExprId`] — can only index into `Ast::exprs`
+//! - [`StmtId`] — can only index into `Ast::stmts`
 //!
-//! This means `BinaryExpr { lhs: ExprId, rhs: ExprId }` is **statically
-//! guaranteed** to reference expressions, not arbitrary nodes.  The compiler
-//! rejects code that tries to stick a `StmtId` where an `ExprId` is expected.
+//! This means `Binary { lhs: ExprId, rhs: ExprId }` is statically guaranteed
+//! to reference expressions, not arbitrary nodes.
 //!
-//! ## Why not a flat columnar/SoA layout?
+//! ## Span storage
 //!
-//! A flat `Vec<AstNodeKind>` with `u32` indices is simpler, but:
-//!
-//! 1. **No type safety** — a `u32` can index into any column, so
-//!    `BinaryExpr { lhs: u32 }` could silently point at a `Root` node.
-//! 2. **Error-prone** — lowering must use placeholder-then-patch patterns,
-//!    which can create self-referential cycles on failure.
-//! 3. **Harder to extend** — adding new node categories (types, patterns)
-//!    pollutes a single enum rather than composing separate arenas.
-//!
-//! The typed-arena approach (used by rust-analyzer) avoids all three issues
-//! while remaining cache-friendly (each arena is a contiguous `Vec`).
+//! Source spans are stored in parallel `Vec`s (`expr_spans`, `stmt_spans`)
+//! using [`TokenSpan`] — a packed (token-index, count) pair.  No line or
+//! column numbers are stored in nodes; LSP positions are computed on demand
+//! via [`lw_cst::LineIndex`].
 //!
 //! ## Error recovery
 //!
 //! [`Expr::Missing`] and [`Stmt::Error`] represent nodes that failed to parse
-//! or lower.  They participate in the tree without creating cycles.
-//!
-//! The storage is WASM-safe: no OS threads, no allocator tricks, just `Vec`s
-//! behind `Arena<T>`.
+//! or lower.  They are leaf nodes with no children, so they cannot create
+//! reference cycles.
 
-use la_arena::{Arena, ArenaMap, Idx};
-
-pub use lw_cst::{BinOp, TextRange};
+pub use lw_cst::{BinOp, TokenSpan};
 
 // ---------------------------------------------------------------------------
 // Typed indices
 // ---------------------------------------------------------------------------
 
-/// A typed index into the expression arena.
-pub type ExprId = Idx<Expr>;
+/// A typed index into `Ast::exprs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExprId(pub u32);
 
-/// A typed index into the statement arena.
-pub type StmtId = Idx<Stmt>;
+/// A typed index into `Ast::stmts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StmtId(pub u32);
 
 // ---------------------------------------------------------------------------
 // Expression nodes
@@ -98,22 +88,21 @@ pub enum Stmt {
 
 /// The complete AST for a single source file.
 ///
-/// Expressions and statements live in separate typed arenas.  Source spans are
-/// stored in parallel [`ArenaMap`]s so that the core node types remain small
-/// and cache-friendly, while span information is available when needed (e.g.
-/// for diagnostics and hover).
+/// All data is stored in flat `Vec`s.  Source spans are stored in parallel
+/// arrays keyed by the same index, so the core node types remain small and
+/// cache-friendly while span information is available when needed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ast {
-    /// All expressions in this file.
-    pub exprs: Arena<Expr>,
-    /// All statements in this file.
-    pub stmts: Arena<Stmt>,
+    /// All expressions in this file (indexed by [`ExprId`]).
+    pub exprs: Vec<Expr>,
+    /// All statements in this file (indexed by [`StmtId`]).
+    pub stmts: Vec<Stmt>,
     /// The ordered list of top-level statements (execution order).
     pub top_level: Vec<StmtId>,
-    /// Source spans for expressions, keyed by [`ExprId`].
-    pub expr_ranges: ArenaMap<ExprId, TextRange>,
-    /// Source spans for statements, keyed by [`StmtId`].
-    pub stmt_ranges: ArenaMap<StmtId, TextRange>,
+    /// Source spans for expressions, parallel to `exprs`.
+    pub expr_spans: Vec<TokenSpan>,
+    /// Source spans for statements, parallel to `stmts`.
+    pub stmt_spans: Vec<TokenSpan>,
 }
 
 impl Ast {
@@ -123,36 +112,46 @@ impl Ast {
     }
 
     /// Allocate an expression and record its source span.
-    pub fn alloc_expr(&mut self, expr: Expr, range: TextRange) -> ExprId {
-        let id = self.exprs.alloc(expr);
-        self.expr_ranges.insert(id, range);
+    pub fn alloc_expr(&mut self, expr: Expr, span: TokenSpan) -> ExprId {
+        let id = ExprId(self.exprs.len() as u32);
+        self.exprs.push(expr);
+        self.expr_spans.push(span);
         id
     }
 
     /// Allocate a statement and record its source span.
-    pub fn alloc_stmt(&mut self, stmt: Stmt, range: TextRange) -> StmtId {
-        let id = self.stmts.alloc(stmt);
-        self.stmt_ranges.insert(id, range);
+    pub fn alloc_stmt(&mut self, stmt: Stmt, span: TokenSpan) -> StmtId {
+        let id = StmtId(self.stmts.len() as u32);
+        self.stmts.push(stmt);
+        self.stmt_spans.push(span);
         id
     }
 
     /// Look up an expression by ID.
     pub fn expr(&self, id: ExprId) -> &Expr {
-        &self.exprs[id]
+        &self.exprs[id.0 as usize]
     }
 
     /// Look up a statement by ID.
     pub fn stmt(&self, id: StmtId) -> &Stmt {
-        &self.stmts[id]
+        &self.stmts[id.0 as usize]
     }
 
     /// Get the source span of an expression.
-    pub fn expr_range(&self, id: ExprId) -> Option<&TextRange> {
-        self.expr_ranges.get(id)
+    pub fn expr_span(&self, id: ExprId) -> &TokenSpan {
+        &self.expr_spans[id.0 as usize]
     }
 
     /// Get the source span of a statement.
-    pub fn stmt_range(&self, id: StmtId) -> Option<&TextRange> {
-        self.stmt_ranges.get(id)
+    pub fn stmt_span(&self, id: StmtId) -> &TokenSpan {
+        &self.stmt_spans[id.0 as usize]
+    }
+
+    /// Iterate over all expressions with their IDs.
+    pub fn iter_exprs(&self) -> impl Iterator<Item = (ExprId, &Expr)> {
+        self.exprs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (ExprId(i as u32), e))
     }
 }

@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use lw_ast::{Ast, Expr, Stmt, StmtId, TextRange};
+use lw_ast::{Ast, Expr, Stmt, StmtId, TokenSpan};
 use lw_vfs::Vfs;
 
 use crate::{lower::lower, parser::parse};
@@ -29,9 +29,12 @@ pub enum Severity {
 }
 
 /// A user-visible diagnostic message.
+///
+/// Spans are stored as [`TokenSpan`] — no line or column numbers.  Use
+/// [`lw_cst::LineIndex::byte_to_lsp_position`] to convert to LSP positions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
-    pub range: TextRange,
+    pub span: TokenSpan,
     pub message: String,
     pub severity: Severity,
 }
@@ -62,18 +65,18 @@ pub fn resolve(_path: &str, vfs: &Vfs, ast: &Ast) -> ResolvedProgram {
         let Stmt::Import { path: import_path } = ast.stmt(stmt_id) else {
             continue;
         };
-        let span = ast.stmt_range(stmt_id).cloned().unwrap_or_default();
+        let span = *ast.stmt_span(stmt_id);
 
         match vfs.read(import_path) {
             Some(rope) => {
                 let imported_source = rope.to_string();
                 let result = parse(&imported_source);
-                let lr = lower(&result.arena, result.root, &imported_source);
+                let lr = lower(&result.arena, &result.tree, result.root);
                 collect_bindings_from(&lr.ast, &mut bindings, &mut diagnostics);
             }
             None => {
                 diagnostics.push(Diagnostic {
-                    range: span,
+                    span,
                     message: format!("import not found: {}", import_path),
                     severity: Severity::Error,
                 });
@@ -108,10 +111,10 @@ pub fn collect_bindings_from(
         let Stmt::Let { name, .. } = ast.stmt(stmt_id) else {
             continue;
         };
-        let span = ast.stmt_range(stmt_id).cloned().unwrap_or_default();
+        let span = *ast.stmt_span(stmt_id);
         if bindings.contains_key(name) {
             diagnostics.push(Diagnostic {
-                range: span,
+                span,
                 message: format!("duplicate binding: {}", name),
                 severity: Severity::Error,
             });
@@ -128,14 +131,14 @@ pub fn check_identifiers_against(
     bindings: &HashMap<String, StmtId>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (id, expr) in ast.exprs.iter() {
+    for (id, expr) in ast.iter_exprs() {
         let Expr::Identifier(name) = expr else {
             continue;
         };
         if !bindings.contains_key(name) {
-            let span = ast.expr_range(id).cloned().unwrap_or_default();
+            let span = *ast.expr_span(id);
             diagnostics.push(Diagnostic {
-                range: span,
+                span,
                 message: format!("unknown identifier: {}", name),
                 severity: Severity::Error,
             });
